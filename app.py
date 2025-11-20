@@ -413,7 +413,7 @@ def desktop_layout():
                                 {"label": "Angle of Bank Shading", "value": "aob"},
                                 {"label": "Negative G Envelope", "value": "negative_g"}
                             ],
-                            value=["ps", "g", "radius", "aob"],
+                            value=["g", "radius", "aob"],
                             labelStyle={"display": "block"},
                             className="checklist mb-3"
                         ),
@@ -423,7 +423,7 @@ def desktop_layout():
                                 id="oei-toggle",
                                 options=[{"label": "Simulate One Engine Inoperative", "value": "enabled"}],
                                 value=[],
-                                style={"margin-bottom": "5px"},
+                                style={"marginBottom": "5px"},
                             )
                         ], id="oei-container", className="mb-3"),
                         # OEI toggle (Simulate One Engine Inoperative)
@@ -720,7 +720,7 @@ def mobile_layout():
                                 {"label": "Angle of Bank Shading", "value": "aob"},
                                 {"label": "Negative G Envelope", "value": "negative_g"}
                             ],
-                            value=["ps", "g", "radius", "aob"],
+                            value=["g", "radius", "aob"],
                             labelStyle={"display": "block"},
                             className="checklist mb-3"
                         ),
@@ -730,7 +730,7 @@ def mobile_layout():
                                 id="oei-toggle",
                                 options=[{"label": "Simulate One Engine Inoperative", "value": "enabled"}],
                                 value=[],
-                                style={"margin-bottom": "5px"},
+                                style={"marginBottom": "5px"},
                             )
                         ], id="oei-container", className="mb-3"),
                         # OEI toggle (Simulate One Engine Inoperative)

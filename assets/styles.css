@@ -77,8 +77,9 @@ label {
 }
 .main-row {
   display: flex;
-  height: calc(100vh - 110px); /* header height */
-  overflow: hidden;
+  flex: 1 1 auto;      /* fill remaining space under banner */
+  min-height: 0;       /* allow flex children to shrink */
+  overflow: hidden;      /* scroll instead of cutting off */
 }
 .resizable-sidebar {
   width: 360px;
@@ -92,19 +93,23 @@ label {
   box-sizing: border-box;
 }
 .graph-column {
-  flex-grow: 1;
+  flex: 1 1 auto;
   padding: 20px;
-  overflow: hidden;
+  overflow-y: auto;          /* scroll right column when too tall */
+  overflow-x: hidden;
+  display: flex;
+  flex-direction: column;
 }
 
 /* === Graph === */
 .graph-panel {
   width: 100%;
-  aspect-ratio: 5 / 3;
+  flex: 1 1 auto;
 }
 .graph-panel > .dash-graph {
   height: 100% !important;
   width: 100% !important;
+  min-height: 0;
 }
 
 /* === Form Elements === */
@@ -206,6 +211,7 @@ button:hover,
   color: #888;
   font-size: 12px;
   margin-top: 20px;
+  flex-shrink: 0;
 }
 
 /* === Responsive (Mobile) === */
