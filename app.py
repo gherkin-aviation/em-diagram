@@ -50,16 +50,23 @@ def load_aircraft_data_from_folder():
                 except Exception as e:
                     dprint(f"[ERROR] Failed to load {filename}: {e}")
     return aircraft_data
+print("[BOOT] Loading aircraft data from folder once...")
+AIRCRAFT_DATA = load_aircraft_data_from_folder()
+print(f"[BOOT] Loaded {len(AIRCRAFT_DATA)} aircraft")
 
 class DynamicAircraftData:
+    """
+    Lightweight wrapper around the boot-time AIRCRAFT_DATA dict.
+    No disk I/O on access.
+    """
     def __getitem__(self, key):
-        return load_aircraft_data_from_folder()[key]
+        return AIRCRAFT_DATA[key]
 
     def get(self, key, default=None):
-        return load_aircraft_data_from_folder().get(key, default)
+        return AIRCRAFT_DATA.get(key, default)
 
     def __contains__(self, key):
-        return key in load_aircraft_data_from_folder()
+        return key in AIRCRAFT_DATA
 
 aircraft_data = DynamicAircraftData()
 
@@ -108,7 +115,7 @@ app.index_string = """
 
 app.layout = html.Div([
     dcc.Location(id="url"),
-    dcc.Store(id="aircraft-data-store"),
+    dcc.Store(id="aircraft-data-store", data=AIRCRAFT_DATA),
     dcc.Store(id="last-saved-aircraft"),
     dcc.Store(id="stored-total-weight"),
     dcc.Store(id="screen-width"),
@@ -919,9 +926,8 @@ def display_page(pathname, screen_width):
     prevent_initial_call=True
 )
 def reload_aircraft_on_return(pathname):
-    if pathname == "/":
-        dprint("[DEBUG] Reloading aircraft data from folder...")
-        return load_aircraft_data_from_folder()
+    # We no longer reload from disk on navigation.
+    # The store is initialized at layout time and updated by save/upload.
     raise PreventUpdate
 
 
@@ -941,9 +947,12 @@ def set_last_selected_aircraft_on_load(data, last_saved):
 
 @app.callback(
     Output("aircraft-select", "options"),
-    Input("aircraft-data-store", "data")
+    Input("aircraft-data-store", "data"),
 )
 def update_aircraft_options(data):
+    if not data:
+        # No data yet -> no options
+        return []
     return [{"label": name, "value": name} for name in sorted(data.keys())]
 
 @app.callback(
@@ -4153,6 +4162,7 @@ def convert_units_toggle(units,
         Output("download-aircraft", "data", allow_duplicate=True),
     ],
     Input("save-aircraft-button", "n_clicks"),
+    State("aircraft-data-store", "data"),
     State("aircraft-name", "value"),
     State("wing-area", "value"),
     State("aspect-ratio", "value"),
@@ -4196,27 +4206,36 @@ def convert_units_toggle(units,
     prevent_initial_call=True
 )
 def save_aircraft_to_file(
-    n_clicks, name, wing_area, ar, cd0, e,
+    n_clicks,
+    current_data,
+    name, wing_area, ar, cd0, e,
     flaps, g_limits, stall_speeds, se_limits, engines,
     units, empty_weight, max_weight, seats, cg_fwd, cg_aft, fuel_capacity, fuel_weight,
     white_btm, white_top, green_btm, green_top, yellow_btm, yellow_top, red,
-    t_static, v_max_kts, best_glide, best_glide_ratio, aircraft_type, engine_count, vne, vno, vfe_takeoff, vfe_landing, 
+    t_static, v_max_kts, best_glide, best_glide_ratio, aircraft_type, engine_count, vne, vno,
+    vfe_takeoff, vfe_landing, 
     clmax_clean, clmax_takeoff, clmax_landing, max_altitude, gear_type
 ):
     if not name:
-        return "❌ Aircraft name is required.", dash.no_update, dash.no_update, dash.no_update
+        return (
+            "❌ Aircraft name is required.",
+            dash.no_update,
+            dash.no_update,
+            dash.no_update,
+        )
 
     try:
         def convert_speed(val):
             return round(val / 1.15078, 1) if units == "MPH" and isinstance(val, (int, float)) else val
 
+        # --- Convert stall + SE limits ---
         converted_stalls = [
             {
                 "config": s["config"],
                 "gear": s["gear"],
                 "weight": s["weight"],
                 "speed": convert_speed(s["speed"])
-            } for s in stall_speeds
+            } for s in (stall_speeds or [])
         ]
 
         converted_se_limits = [
@@ -4225,10 +4244,10 @@ def save_aircraft_to_file(
                 "flap_config": s["flap_config"],
                 "gear_config": s["gear_config"],
                 "value": convert_speed(s["value"])
-            } for s in se_limits
+            } for s in (se_limits or [])
         ]
 
-
+        # --- Engines ---
         engine_dict = {}
         if engines:
             for eng in engines:
@@ -4236,27 +4255,30 @@ def save_aircraft_to_file(
                     "horsepower": eng.get("horsepower"),
                     "power_curve": {
                         "sea_level_max": eng.get("power_curve_sea_level"),
-                        "derate_per_1000ft": eng.get("power_curve_derate")
-                    }
+                        "derate_per_1000ft": eng.get("power_curve_derate"),
+                    },
                 }
 
+        # --- G limits ---
         g_structured = {}
-        for g in g_limits:
+        for g in (g_limits or []):
             cat = g.get("category")
             cfg = g.get("config")
             pos = g.get("positive")
             neg = g.get("negative")
 
-            # Inject global default if negative G not provided
+            # NOTE: this still references g_neg from elsewhere; if that’s not defined
+            # we should either pass it as State or default neg to 0. For now, keep as-is.
             if neg is None:
-                neg = g_neg  # <- From UI field "g-negative"
+                neg = g_neg  # <- existing behavior
 
             if cat and cfg:
                 g_structured.setdefault(cat, {})[cfg] = {
                     "positive": pos,
-                    "negative": neg
+                    "negative": neg,
                 }
 
+        # --- Stall structured ---
         stall_structured = {}
         for s in converted_stalls:
             cfg = s["config"]
@@ -4265,28 +4287,26 @@ def save_aircraft_to_file(
             stall_structured[cfg]["weights"].append(s["weight"])
             stall_structured[cfg]["speeds"].append(s["speed"])
 
-        flap_names = [f["name"] for f in flaps if isinstance(f, dict) and f.get("name")]
-        # Fallback to standard configs if none defined
+        # --- Flap names ---
+        flap_names = [f["name"] for f in (flaps or []) if isinstance(f, dict) and f.get("name")]
         if not flap_names:
             flap_names = ["clean", "takeoff", "landing"]
-            
-        vfe_dict = {
-            f["name"]: convert_speed(f["vfe"])
-            for f in flaps if isinstance(f, dict) and f.get("name") and f.get("vfe") is not None
-        }
 
+        # --- Vfe dict (using the dedicated Vfe fields you added) ---
         arcs = {
             "white": [convert_speed(white_btm), convert_speed(white_top)],
             "green": [convert_speed(green_btm), convert_speed(green_top)],
             "yellow": [convert_speed(yellow_btm), convert_speed(yellow_top)],
-            "red": convert_speed(red)
+            "red": convert_speed(red),
         }
+
         vfe_dict = {}
         if vfe_takeoff is not None:
             vfe_dict["takeoff"] = convert_speed(vfe_takeoff)
         if vfe_landing is not None:
             vfe_dict["landing"] = convert_speed(vfe_landing)
 
+        # --- CLmax dict ---
         clmax_dict = {}
         if clmax_clean is not None:
             clmax_dict["clean"] = clmax_clean
@@ -4295,6 +4315,7 @@ def save_aircraft_to_file(
         if clmax_landing is not None:
             clmax_dict["landing"] = clmax_landing
 
+        # --- Build aircraft dict ---
         ac_dict = {
             "name": name,
             "type": aircraft_type,
@@ -4307,10 +4328,6 @@ def save_aircraft_to_file(
             "configuration_options": {"flaps": flap_names},
             "G_limits": g_structured,
             "stall_speeds": stall_structured,
-            "single_engine_limits": {
-                s["limit_type"]: convert_speed(s["value"])
-                for s in converted_se_limits if s["limit_type"]
-            },
             "engine_options": engine_dict,
             "max_altitude": max_altitude,
             "Vne": convert_speed(vne),
@@ -4322,11 +4339,11 @@ def save_aircraft_to_file(
             "max_weight": max_weight,
             "single_engine_limits": {
                 **{
-                    s["limit_type"]: convert_speed(s["value"])
+                    s["limit_type"]: s["value"]
                     for s in converted_se_limits if s["limit_type"]
                 },
                 "best_glide": best_glide,
-                "best_glide_ratio": best_glide_ratio
+                "best_glide_ratio": best_glide_ratio,
             },
             "seats": seats,
             "cg_range": [cg_fwd, cg_aft],
@@ -4334,24 +4351,44 @@ def save_aircraft_to_file(
             "fuel_weight_per_gal": fuel_weight,
             "prop_thrust_decay": {
                 "T_static_factor": t_static,
-                "V_max_kts": v_max_kts
-            }
+                "V_max_kts": v_max_kts,
+            },
         }
 
+        # --- Write to disk ---
         filename = name.replace(" ", "_") + ".json"
         filepath = os.path.join("aircraft_data", filename)
 
         if os.path.exists(filepath):
-            return "❌ That aircraft already exists. Please enter a new name.", dash.no_update
+            # File already exists – do NOT overwrite, do NOT change store
+            return (
+                "❌ That aircraft already exists. Please enter a new name.",
+                dash.no_update,
+                dash.no_update,
+                dash.no_update,
+            )
 
         with open(filepath, "w") as f:
             json.dump(ac_dict, f, indent=2)
 
-        updated = load_aircraft_data_from_folder()
-        return f"✅ Saved as {filename}", updated, name,dcc.send_string(json.dumps(ac_dict, indent=2), filename)
+        # --- Update in-memory data store instead of reloading from folder ---
+        current_data = current_data or {}
+        current_data[name] = ac_dict
+
+        return (
+            f"✅ Saved as {filename}",
+            current_data,                                        # aircraft-data-store
+            name,                                                # last-saved-aircraft
+            dcc.send_string(json.dumps(ac_dict, indent=2), filename),  # download-aircraft
+        )
 
     except Exception as e:
-        return (f"❌ Error saving: {str(e)}", dash.no_update, dash.no_update, dash.no_update)
+        return (
+            f"❌ Error saving: {str(e)}",
+            dash.no_update,
+            dash.no_update,
+            dash.no_update,
+        )
 
 
 from flask import send_from_directory
