@@ -1815,7 +1815,12 @@ def update_graph(
         T_available = np.maximum(T_available, 0)
 
         gamma_rad = np.radians(pitch_angle)
-        Ps = ((T_available - D) * V / weight - g * np.sin(gamma_rad)) / 1.68781
+
+        # Vertical speed term (ft/s); for gamma=0 this is just 0
+        V_vertical = V * np.sin(gamma_rad)
+
+        # Ps in knots per second
+        Ps = ((T_available - D) * V / weight - V_vertical) / 1.68781
 
         # Envelope mask (vectorized)
         v_fts_env = IAS * 1.68781
