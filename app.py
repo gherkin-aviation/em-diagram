@@ -9,6 +9,24 @@ from edit_aircraft_page import edit_aircraft_layout
 import copy 
 from dash import ctx
 from dash.exceptions import PreventUpdate
+from core.calculations import (
+    compute_dynamic_pressure,
+    compute_cl,
+    compute_cd,
+    compute_drag,
+    compute_thrust_available,
+    compute_ps_knots_per_sec,
+)
+import time
+
+# Toggle for console debug logging
+DEBUG_LOG = False  # set to False before deploying to Render
+
+
+def dprint(*args, **kwargs):
+    """Debug print that can be globally toggled."""
+    if DEBUG_LOG:
+        print(*args, **kwargs)
 
 
 
@@ -30,7 +48,7 @@ def load_aircraft_data_from_folder():
                     name = os.path.splitext(filename)[0].replace("_", " ")
                     aircraft_data[name] = data
                 except Exception as e:
-                    print(f"[ERROR] Failed to load {filename}: {e}")
+                    dprint(f"[ERROR] Failed to load {filename}: {e}")
     return aircraft_data
 
 class DynamicAircraftData:
@@ -531,48 +549,30 @@ dcc.Checklist(id="oei-toggle", style={"display": "none"}, options=[], value=[])
 
 def mobile_layout():
     return html.Div([
-            # Header Row (centered banner logo inside a fixed-height header)
+        # Header Row (logo banner)
         html.Div([
             html.Div([
                 html.A(
                     html.Img(src="/assets/logo.png", className="banner-logo"),
-                    href="https://flyaeroedge.com",  # 🔁 replace with your main URL
+                    href="https://flyaeroedge.com",
                     style={"textDecoration": "none"}
                 )
             ], className="banner-inner")
         ], className="banner-header"),
 
-        # Two-Column Flex Layout: Sidebar + Graph
+        # Main App Layout
         html.Div([
-            # Sidebar Left
+            # Sidebar
             dbc.Col([
                 html.Div(id="resize-handle", className="resize-handle"),
                 html.Div("EM Diagram Generator", style={
-                    "fontWeight": "600",
-                    "fontSize": "20px",
-                    "marginBottom": "10px",
-                    "color": "#1b1e23"  # match your theme color
+                    "fontWeight": "600", "fontSize": "20px",
+                    "marginBottom": "10px", "color": "#1b1e23"
                 }),
-                dbc.Button(
-                    "Edit / Create Aircraft",
-                    id="edit-aircraft-button",
-                    color="success",
-                    className="mb-3",
-                    style={"width": "200px", "fontWeight": "bold"}
-                ),
-                    dbc.Col(
-                        dcc.Upload(
-                            id="upload-aircraft",
-                            children=dbc.Button(
-                                "📂 Load Aircraft File",
-                                color="info",
-                                style={"fontWeight": "bold"}
-                            ),
-                            multiple=False,
-                            accept=".json"
-                        ),
-                        
-                    ),                
+
+                dbc.Button("Edit / Create Aircraft", id="edit-aircraft-button", color="success", className="mb-3", style={"width": "200px", "fontWeight": "bold"}),
+                dbc.Col(dcc.Upload(id="upload-aircraft", children=dbc.Button("\ud83d\udcc2 Load Aircraft File", color="info", style={"fontWeight": "bold"}), multiple=False, accept=".json")),
+                                                       
 
                 # Aircraft Configuration Panel
                 dbc.Card([
@@ -787,30 +787,25 @@ def mobile_layout():
 
                 # Export
                 dbc.Card([
-                    dbc.CardHeader("Export as PNG (use 📷 icon on graph)"),
+                    dbc.CardHeader("Export as PNG (use \ud83d\udcf7 icon on graph)"),
                     dbc.CardBody([
                         dbc.Button("Export as PDF", id="pdf-button", color="primary", className="me-2"),
                         dcc.Download(id="pdf-download")
                     ])
                 ]),
 
-                # Error Reporting
+                # Error Reporting and Contact
                 dbc.Card([
                     dbc.CardBody([
-                        dbc.Button(
-                            "Report An Issue",
-                            href="https://forms.gle/1xP29PwFze5MHCTZ7",
-                            color="danger",
-                            target="_blank",
-                            className="me-2"
-                        )
-                    ])
-                ]),
+                        dbc.Button("Report An Issue", href="https://forms.gle/1xP29PwFze5MHCTZ7", color="danger", target="_blank", className="me-2"),
+                        dbc.Button("Contact AeroEdge", href="https://forms.gle/AqS1uuTgcY6sRHob9", color="secondary", target="_blank")
+                    ], style={"display": "flex", "gap": "10px", "flexWrap": "wrap"})
+                ], style={"marginTop": "5px", "marginBottom": "5px"}),
             ], xs=12, md=4, className="resizable-sidebar"),
 
             # Graph Column
             dbc.Col([
-                html.Div([  # This div enforces the aspect ratio
+                html.Div([
                     dcc.Graph(
                         id="em-graph",
                         config={
@@ -830,12 +825,66 @@ def mobile_layout():
                     )
                 ], className="graph-panel"),
             ], className="graph-wrapper"),
-            html.Div("© 2025 Nicholas Len, AEROEDGE. All rights reserved. For reference and educational purposes only.", className="footer")
-            
-        ],className="main-row")
-    ], className="full-height-container"),
 
-dcc.Checklist(id="oei-toggle", style={"display": "none"}, options=[], value=[])
+            # Legal Section (bottom)
+            html.Div([
+                html.Div("\u00a9 2025 Nicholas Len, AEROEDGE. All rights reserved. For reference and educational purposes only.", className="footer"),
+
+                # Legal Links Row
+                html.Div([
+                    html.A("Full Legal Disclaimer", href="#", id="open-disclaimer", style={"fontSize": "13px", "textDecoration": "underline", "color": "#007bff", "cursor": "pointer"}),
+                    html.Span(" | ", style={"margin": "0 6px", "color": "#999"}),
+                    html.A("Terms of Use & Privacy Policy", href="#", id="open-terms-policy", style={"fontSize": "13px", "textDecoration": "underline", "color": "#007bff", "cursor": "pointer"})
+                ], style={"textAlign": "center", "marginTop": "8px", "marginBottom": "12px"}),
+
+                # FAA Disclaimer Banner
+                html.Div(
+                    "\u26a0\ufe0f This tool visualizes performance data based on public or user-submitted values and is for educational use only. It is not FAA-approved and may not reflect actual aircraft capabilities. Always verify against the aircraft's POH/AFM. \u26a0\ufe0f",
+                    style={
+                        "backgroundColor": "#fff3cd", "border": "1px solid #ffeeba",
+                        "padding": "8px 14px", "fontSize": "12px", "color": "#856404",
+                        "textAlign": "center", "fontWeight": "500", "margin": "0 12px 10px 12px"
+                    }
+                ),
+            ]),
+        ], className="main-row"),
+
+        # Modals (disclaimer + terms)
+        dbc.Modal([
+            dbc.ModalHeader("AeroEdge Disclaimer", close_button=False),
+            dbc.ModalBody([
+                html.P("This tool supplements\u2014not replaces\u2014FAA-published documentation.", style={"marginBottom": "8px"}),
+                html.P("It is intended for educational and reference use only, and has not been approved or endorsed by the Federal Aviation Administration (FAA).", style={"marginBottom": "8px"}),
+                html.P("While AeroEdge is aligned with FAA safety principles, it is not an official source of operational data. Users must consult certified instructors and approved aircraft documentation when making flight decisions.", style={"marginBottom": "8px"}),
+                html.P("The data presented may be incomplete, inaccurate, outdated, or derived from public or user-submitted sources. No warranties, express or implied, are made regarding its accuracy, completeness, or fitness for purpose.", style={"marginBottom": "8px"}),
+                html.P("Instructors and users are encouraged to verify all EM diagram outputs against certified POH/AFM values. This tool is not a substitute for competent flight instruction, or for compliance with applicable regulations, including Airworthiness Directives (ADs), Federal Aviation Regulations (FARs), or Advisory Circulars (ACs).", style={"marginBottom": "8px"}),
+                html.P("If any information conflicts with the aircraft\u2019s FAA-approved AFM or POH, the official documentation shall govern.", style={"marginBottom": "8px"}),
+                html.P("AeroEdge disclaims all liability for errors, omissions, injuries, or damages resulting from the use of this application or website. Use of this tool constitutes acceptance of these terms.", style={"marginBottom": "8px"})
+            ]),
+            dbc.ModalFooter(
+                dbc.Button("Close", id="close-disclaimer", className="ms-auto", color="secondary")
+            )
+        ], id="disclaimer-modal", is_open=False),
+
+        dbc.Modal([
+            dbc.ModalHeader("Terms of Use & Privacy Policy", close_button=False),
+            dbc.ModalBody([
+                html.H6("Terms of Use", className="mb-2 mt-2"),
+                html.P("By accessing or using the AeroEdge application and its associated services, you agree to use this tool solely for educational and informational purposes. This tool is not FAA-certified and should not be relied upon for flight planning, aircraft operation, or regulatory compliance.", style={"marginBottom": "8px"}),
+                html.P("Users must verify all performance data with the aircraft's official Pilot's Operating Handbook (POH) or Aircraft Flight Manual (AFM). Use of AeroEdge is at your own risk. AeroEdge disclaims liability for any direct, indirect, incidental, or consequential damages arising from its use.", style={"marginBottom": "8px"}),
+                html.H6("Privacy Policy", className="mb-2 mt-4"),
+                html.P("AeroEdge does not collect, store, or share any personally identifiable information (PII). All use of the application is anonymous. Uploaded aircraft files remain local to your device and are not transmitted or stored on any external servers.", style={"marginBottom": "8px"}),
+                html.P("If you submit feedback through linked forms, that information is governed by the terms of Google Forms. AeroEdge does not sell or distribute any user-submitted information and uses it only to improve functionality and user experience.", style={"marginBottom": "8px"}),
+                html.P("By using this application, you acknowledge and accept these terms.")
+            ]),
+            dbc.ModalFooter(
+                dbc.Button("Close", id="close-terms-policy", className="ms-auto", color="secondary")
+            )
+        ], id="terms-policy-modal", is_open=False),
+
+        # Store fallback for checklist
+        dcc.Checklist(id="oei-toggle", style={"display": "none"}, options=[], value=[])
+    ], className="full-height-container")
 
 
 # ✅ Automatically open the browser when the app starts
@@ -871,7 +920,7 @@ def display_page(pathname, screen_width):
 )
 def reload_aircraft_on_return(pathname):
     if pathname == "/":
-        print("[DEBUG] Reloading aircraft data from folder...")
+        dprint("[DEBUG] Reloading aircraft data from folder...")
         return load_aircraft_data_from_folder()
     raise PreventUpdate
 
@@ -1024,7 +1073,7 @@ def render_cg_slider(ac_name):
         str(cg_max): f"AFT ({cg_max:.1f}\")"
     }
 
-    print("CG DEBUG:", {
+    dprint("CG DEBUG:", {
         "cg_min": cg_min,
         "cg_mid": cg_mid,
         "cg_max": cg_max,
@@ -1299,6 +1348,7 @@ def update_graph(
     screen_width
     
 ):
+    t_start = time.perf_counter()
     import plotly.graph_objects as go  # <== you must ensure this is imported here if not at top of file
 
     all_overlays = overlay_toggle + multi_engine_toggle_options
@@ -1386,7 +1436,7 @@ def update_graph(
         
 
     # ✅ Debug log
-    print("ENGINE DEBUG:", {
+    dprint("ENGINE DEBUG:", {
         "ac": ac_name,
         "engine": engine_name,
         "oei_active": oei_active,
@@ -1442,7 +1492,7 @@ def update_graph(
     cl_max *= gear_lift_factor
     cg_drag_factor = 1 + 0.04 * (0.5 - cg_fraction)     # up to 4% added drag for FWD CG
 
-    print("CG INFLUENCE:", {
+    dprint("CG INFLUENCE:", {
         "cg": cg,
         "cl_base": cl_base,
         "cl_max_adj": cl_max,
@@ -1763,18 +1813,18 @@ def update_graph(
 
     Ps_masked = np.where(mask, np.nan, Ps)
 
-    print(f"[Ps DEBUG] ----")
-    print(f"  Air Density: {rho:.5f} slugs/ft³")
-    print(f"  CL avg: {np.nanmean(CL):.2f}, CD avg: {np.nanmean(CD):.3f}")
-    print(f"  Thrust avg: {np.nanmean(T_available):.1f} lbs")
-    print(f"  Drag avg: {np.nanmean(D):.1f} lbs")
-    print(f"  Ps min: {np.nanmin(Ps):.2f}, Ps max: {np.nanmax(Ps):.2f} knots/sec")
-    print(f"  Flight Path Angle (γ): {pitch_angle}°")
-    print("[THRUST DECAY DEBUG]")
-    print(f"  V_max_kts: {V_max_kts}")
-    print(f"  T_static: {T_static:.1f} lbs")
-    print(f"  T_available avg: {np.nanmean(T_available):.1f} lbs")
-    print(f"  Drag avg: {np.nanmean(D):.1f} lbs")
+    dprint(f"[Ps DEBUG] ----")
+    dprint(f"  Air Density: {rho:.5f} slugs/ft³")
+    dprint(f"  CL avg: {np.nanmean(CL):.2f}, CD avg: {np.nanmean(CD):.3f}")
+    dprint(f"  Thrust avg: {np.nanmean(T_available):.1f} lbs")
+    dprint(f"  Drag avg: {np.nanmean(D):.1f} lbs")
+    dprint(f"  Ps min: {np.nanmin(Ps):.2f}, Ps max: {np.nanmax(Ps):.2f} knots/sec")
+    dprint(f"  Flight Path Angle (γ): {pitch_angle}°")
+    dprint("[THRUST DECAY DEBUG]")
+    dprint(f"  V_max_kts: {V_max_kts}")
+    dprint(f"  T_static: {T_static:.1f} lbs")
+    dprint(f"  T_available avg: {np.nanmean(T_available):.1f} lbs")
+    dprint(f"  Drag avg: {np.nanmean(D):.1f} lbs")
 
    
 # --- AOB HEATMAP: 10° to 90°, clipped to envelope ---
@@ -2427,7 +2477,7 @@ def update_graph(
                     if found:
                         break
         except Exception as e:
-            print(f"[DEBUG] Ps toggle failed: {e}")
+            dprint(f"[DEBUG] Ps toggle failed: {e}")
 
 
         ###---Vmc published line----###
@@ -2568,10 +2618,10 @@ def update_graph(
         gamma_rad = np.radians(pitch_angle)
         Ps_steep = ((T_avail - D) * v_fts / weight - g * np.sin(gamma_rad)) / 1.68781
 
-        print("[STEEP TURN DEBUG]")
-        print(f"  IAS: {ias_input} KIAS, AOB: {aob_input}°")
-        print(f"  Turn Rate: {tr_deg:.1f}°/s")
-        print(f"  Ps: {Ps_steep:.2f} knots/sec")
+        dprint("[STEEP TURN DEBUG]")
+        dprint(f"  IAS: {ias_input} KIAS, AOB: {aob_input}°")
+        dprint(f"  Turn Rate: {tr_deg:.1f}°/s")
+        dprint(f"  Ps: {Ps_steep:.2f} knots/sec")
 
         arc_tr = [0.0, tr_deg, tr_deg, 0.0, 0.0]
         arc_ias = [ias_input] * len(arc_tr)
@@ -2678,7 +2728,7 @@ def update_graph(
             steps += 1
 
         if not airspeeds:
-            print("[WARN] No chandelle points generated.")
+            dprint("[WARN] No chandelle points generated.")
             return fig
 
         airspeeds_display = [ias * 1.15078 if unit == "MPH" else ias for ias in airspeeds]
@@ -2739,7 +2789,9 @@ def update_graph(
         align="center",
         name="png-only-disclaimer"
     )
-
+    t_end = time.perf_counter()
+    dprint(f"[PERF] update_graph total: {(t_end - t_start):.3f} sec")
+    
     return fig
 
 import tempfile
@@ -2909,7 +2961,7 @@ def generate_pdf(n_clicks, fig_data, ac_name, engine_name, config, gear, occupan
                 )
             )
     except Exception as e:
-        print(f"[LOGO WARNING] Failed to add logo2.png: {e}")
+        dprint(f"[LOGO WARNING] Failed to add logo2.png: {e}")
 
     # ✅ Summary Text
     oei_status = "YES" if oei_toggle and "enabled" in oei_toggle else "NO"
@@ -4340,11 +4392,11 @@ def load_aircraft_from_upload(contents, filename, current_data):
         current_data = current_data or {}
         current_data[name] = aircraft_json
 
-        print(f"[UPLOAD] Loaded aircraft: {name}")
+        dprint(f"[UPLOAD] Loaded aircraft: {name}")
         return current_data, name, name
 
     except Exception as e:
-        print(f"[UPLOAD ERROR]: {e}")
+        dprint(f"[UPLOAD ERROR]: {e}")
         raise PreventUpdate
 
 @app.callback(
@@ -4386,7 +4438,11 @@ def serve_sitemap():
 
 
 
+import os
+
 if __name__ == "__main__":
-    # threading.Timer(1.0, open_browser).start()
-    # app.run(debug=False, host="127.0.0.1", port=8050)
-    app.run(debug=True)
+    # Use env var to control debug (1 = on, 0 = off)
+    debug_mode = os.environ.get("AEROEDGE_DEBUG", "1") == "1"
+
+    # Local: 127.0.0.1 is fine, Render will override host/port anyway
+    app.run(debug=debug_mode, host="127.0.0.1", port=8050)
