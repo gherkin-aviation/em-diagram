@@ -908,7 +908,7 @@ def display_page(pathname, screen_width):
     if screen_width is None:
         screen_width = 1024  # assume desktop by default
 
-    is_mobile = screen_width and screen_width < 768
+    is_mobile = screen_width < 768
 
     if pathname == "/" or pathname is None:
         return em_diagram_layout(is_mobile=is_mobile)
@@ -1359,6 +1359,23 @@ def update_graph(
 ):
     t_start = time.perf_counter()
     import plotly.graph_objects as go  # <== you must ensure this is imported here if not at top of file
+    
+    # ---- existing validation, etc. ----
+    if not ac_name or ac_name not in aircraft_data:
+        return go.Figure()
+
+    # === Resolution tuning based on screen width ===
+    if screen_width is None:
+        screen_width = 1400  # fallback for server-side calls
+
+    if screen_width < 1200:
+        aob_ias_step = 1.0     # 1 kt increments
+        aob_tr_step = 1.0      # 1 deg/s increments
+    else:
+        aob_ias_step = 0.5     # 0.5 kt increments
+        aob_tr_step = 0.5      # 0.5 deg/s increments
+
+
 
     all_overlays = overlay_toggle + multi_engine_toggle_options
 
@@ -1753,97 +1770,98 @@ def update_graph(
                     bgcolor="rgba(255,255,255,0.5)", borderpad=1
                 )
 
-# --- Ps GRID CALCULATION ---
-    # --- Ps GRID CALCULATION ---
-    ias_vals_ps_internal = np.arange(ias_start, max_speed_internal + 1, 1)
-    ias_vals_ps_display = convert_display_airspeed(ias_vals_ps_internal, unit)
-    CD0 = ac.get("CD0", 0.025)
-    e = ac.get("e", 0.8)
-    AR = ac.get("aspect_ratio", 7.5)
+    # --- Ps GRID CALCULATION (only if Ps overlay enabled) ---
+    Ps_masked = None
+    ias_vals_ps_display = None
+    tr_vals_ps = None
 
-    # Detect steep turn override
-    steep_turn_override = maneuver == "steep_turn" and ias_values and aob_values
-    if steep_turn_override:
-        aob_deg = aob_values[0]
-        aob_rad = np.radians(aob_deg)
-        V = ias_vals_ps_internal * 1.68781
-        TR_fixed = np.degrees(g * np.tan(aob_rad) / V)  # TR as a function of IAS
-        TR = np.tile(TR_fixed, (len(ias_vals_ps_internal), 1)).T  # 2D grid shape
-        IAS = np.tile(ias_vals_ps_internal, (len(TR), 1))
-        tr_vals_ps = TR[:, 0]  # save for mask below
-    else:
-        tr_vals_ps = np.arange(-100, 100, 1)
-        IAS, TR = np.meshgrid(ias_vals_ps_internal, tr_vals_ps)
+    if "ps" in overlay_toggle:
+        ias_vals_ps_internal = np.arange(ias_start, max_speed_internal + 1, 1)
+        ias_vals_ps_display = convert_display_airspeed(ias_vals_ps_internal, unit)
+        CD0 = ac.get("CD0", 0.025)
+        e = ac.get("e", 0.8)
+        AR = ac.get("aspect_ratio", 7.5)
 
-    V = IAS * 1.68781  # convert to ft/s
-    omega_rad = TR * (np.pi / 180)
-    n = np.sqrt(1 + (V * omega_rad / g) ** 2)
+        # Detect steep turn override
+        steep_turn_override = maneuver == "steep_turn" and ias_values and aob_values
+        if steep_turn_override:
+            aob_deg = aob_values[0]
+            aob_rad = np.radians(aob_deg)
+            V = ias_vals_ps_internal * 1.68781
+            TR_fixed = np.degrees(g * np.tan(aob_rad) / V)  # TR as a function of IAS
+            TR = np.tile(TR_fixed, (len(ias_vals_ps_internal), 1)).T  # 2D grid shape
+            IAS = np.tile(ias_vals_ps_internal, (len(TR), 1))
+            tr_vals_ps = TR[:, 0]  # save for mask / plotting
+        else:
+            tr_vals_ps = np.arange(-100, 100, 1)
+            IAS, TR = np.meshgrid(ias_vals_ps_internal, tr_vals_ps)
 
-    q = 0.5 * rho * V**2
-    CL = weight * n / (q * wing_area)
-    CL_clipped = np.minimum(CL, cl_max)
-    CD = (CD0 + (CL_clipped**2) / (np.pi * e * AR)) * cg_drag_factor * gear_drag_factor
-    D = q * wing_area * CD
+        V = IAS * 1.68781  # convert to ft/s
+        omega_rad = TR * (np.pi / 180)
+        n = np.sqrt(1 + (V * omega_rad / g) ** 2)
 
-    # === Propeller Thrust Decay ===
-    V_kts = IAS
-    V_max_kts = ac.get("prop_thrust_decay", {}).get("V_max_kts", 160)
-    T_static = ac.get("prop_thrust_decay", {}).get("T_static_factor", 2.6) * hp
-    V_fraction = np.clip(V_kts / V_max_kts, 0, 1)
-    T_available = T_static * (1 - V_fraction**2)
-    T_available = np.maximum(T_available, 0)
+        q = 0.5 * rho * V**2
+        CL = weight * n / (q * wing_area)
+        CL_clipped = np.minimum(CL, cl_max)
+        CD = (CD0 + (CL_clipped**2) / (np.pi * e * AR)) * cg_drag_factor * gear_drag_factor
+        D = q * wing_area * CD
 
-    gamma_rad = np.radians(pitch_angle)
-    Ps = ((T_available - D) * V / weight - g * np.sin(gamma_rad)) / 1.68781
+        # === Propeller Thrust Decay ===
+        V_kts = IAS
+        V_max_kts = ac.get("prop_thrust_decay", {}).get("V_max_kts", 160)
+        T_static = ac.get("prop_thrust_decay", {}).get("T_static_factor", 2.6) * hp
+        V_fraction = np.clip(V_kts / V_max_kts, 0, 1)
+        T_available = T_static * (1 - V_fraction**2)
+        T_available = np.maximum(T_available, 0)
 
-    # Envelope mask
-    mask = np.ones_like(Ps, dtype=bool)
-    for i in range(Ps.shape[0]):
-        for j in range(Ps.shape[1]):
-            ias = IAS[i, j]
-            tr = TR[i, j]
-            v_fts = ias * 1.68781
-            omega_rad = tr * (np.pi / 180)
-            n_val = np.sqrt(1 + (v_fts * omega_rad / g) ** 2)
-            stall_v_fts = np.sqrt((2 * weight * n_val) / (rho * wing_area * cl_max))
-            stall_ias = stall_v_fts / 1.68781
-            tr_limit_pos = g * np.sqrt(g_limit**2 - 1) / v_fts * 180 / np.pi
-            tr_limit_neg = g * np.sqrt(g_limit_neg**2 - 1) / v_fts * 180 / np.pi
+        gamma_rad = np.radians(pitch_angle)
+        Ps = ((T_available - D) * V / weight - g * np.sin(gamma_rad)) / 1.68781
 
-            if (
-                ias >= stall_ias and
-                (
-                    (tr >= 0 and tr <= tr_limit_pos) or
-                    (tr < 0 and abs(tr) <= tr_limit_neg)
-                ) and
-                ias <= max_speed
-            ):
-                mask[i, j] = False
+        # Envelope mask (vectorized)
+        v_fts_env = IAS * 1.68781
+        omega_rad_env = TR * (np.pi / 180)
 
-    Ps_masked = np.where(mask, np.nan, Ps)
+        n_env = np.sqrt(1 + (v_fts_env * omega_rad_env / g) ** 2)
+        stall_v_fts_env = np.sqrt((2 * weight * n_env) / (rho * wing_area * cl_max))
+        stall_ias_env = stall_v_fts_env / 1.68781
 
-    dprint(f"[Ps DEBUG] ----")
-    dprint(f"  Air Density: {rho:.5f} slugs/ft³")
-    dprint(f"  CL avg: {np.nanmean(CL):.2f}, CD avg: {np.nanmean(CD):.3f}")
-    dprint(f"  Thrust avg: {np.nanmean(T_available):.1f} lbs")
-    dprint(f"  Drag avg: {np.nanmean(D):.1f} lbs")
-    dprint(f"  Ps min: {np.nanmin(Ps):.2f}, Ps max: {np.nanmax(Ps):.2f} knots/sec")
-    dprint(f"  Flight Path Angle (γ): {pitch_angle}°")
-    dprint("[THRUST DECAY DEBUG]")
-    dprint(f"  V_max_kts: {V_max_kts}")
-    dprint(f"  T_static: {T_static:.1f} lbs")
-    dprint(f"  T_available avg: {np.nanmean(T_available):.1f} lbs")
-    dprint(f"  Drag avg: {np.nanmean(D):.1f} lbs")
+        tr_limit_pos_env = g * np.sqrt(g_limit**2 - 1) / v_fts_env * 180 / np.pi
+        tr_limit_neg_env = g * np.sqrt(g_limit_neg**2 - 1) / v_fts_env * 180 / np.pi
+
+        valid_pos = (TR >= 0) & (TR <= tr_limit_pos_env)
+        valid_neg = (TR < 0) & (TR >= tr_limit_neg_env)
+
+        within_env = (
+            (IAS >= stall_ias_env) &
+            (IAS <= max_speed_internal) &
+            (valid_pos | valid_neg)
+        )
+
+        # Ps_masked = usable Ps; outside envelope = NaN
+        Ps_masked = np.where(within_env, Ps, np.nan)
+
+        dprint(f"[Ps DEBUG] ----")
+        dprint(f"  Air Density: {rho:.5f} slugs/ft³")
+        dprint(f"  CL avg: {np.nanmean(CL):.2f}, CD avg: {np.nanmean(CD):.3f}")
+        dprint(f"  Thrust avg: {np.nanmean(T_available):.1f} lbs")
+        dprint(f"  Drag avg: {np.nanmean(D):.1f} lbs")
+        dprint(f"  Ps min: {np.nanmin(Ps):.2f}, Ps max: {np.nanmax(Ps):.2f} knots/sec")
+        dprint(f"  Flight Path Angle (γ): {pitch_angle}°")
+        dprint("[THRUST DECAY DEBUG]")
+        dprint(f"  V_max_kts: {V_max_kts}")
+        dprint(f"  T_static: {T_static:.1f} lbs")
+        dprint(f"  T_available avg: {np.nanmean(T_available):.1f} lbs")
+        dprint(f"  Drag avg: {np.nanmean(D):.1f} lbs")
 
    
 # --- AOB HEATMAP: 10° to 90°, clipped to envelope ---
 
     if "aob" in overlay_toggle:
         # --- AOB HEATMAP (Valid Points Only) ---
-        IAS_vals = np.arange(ias_start, max_speed + 1, 0.1)
+        IAS_vals = np.arange(ias_start, max_speed + 1, aob_ias_step)
         IAS_vals_display = convert_display_airspeed(IAS_vals, unit)
         ias_vals_display = convert_display_airspeed(ias_vals, unit)
-        TR_vals = np.arange(1, 100, 0.1)
+        TR_vals = np.arange(1, 100, aob_tr_step)
         IAS, TR = np.meshgrid(IAS_vals, TR_vals)
         V = IAS * 1.68781
         omega_rad = TR * (np.pi / 180)
@@ -1886,8 +1904,8 @@ def update_graph(
         ))
         # --- AOB HEATMAP (Negative Turn Rates) ---
         if "aob" in overlay_toggle and "negative_g" in overlay_toggle:
-            TR_vals_neg = np.arange(-100, -1, 0.1)
-            IAS_vals_neg = np.arange(ias_start, max_speed + 1, 0.1)
+            TR_vals_neg = np.arange(-100, -1, aob_tr_step)
+            IAS_vals_neg = np.arange(ias_start, max_speed + 1, aob_ias_step)
             IAS_neg, TR_neg = np.meshgrid(IAS_vals_neg, TR_vals_neg)
             V_neg = IAS_neg * 1.68781
             omega_rad_neg = np.abs(TR_neg) * (np.pi / 180)  # use absolute to mirror
@@ -1919,7 +1937,7 @@ def update_graph(
         
 
     if "radius" in overlay_toggle:
-        ias_range = np.arange(ias_start, max_speed + 1, 1)
+        ias_range = np.arange(ias_start, max_speed + 1, 2)
         min_radius = None
         max_radius = 0
 
@@ -2101,64 +2119,9 @@ def update_graph(
                         bgcolor="rgba(255,255,255,0.5)",
                         borderpad=1,
                     )
-    # --- Ps CONTOURS (calculation and envelope masking) ---
-    ias_vals_ps_internal = np.arange(ias_start, max_speed + 1, 1)
-    tr_vals_ps = np.arange(-100, 100, 1)
+    
 
-    IAS, TR = np.meshgrid(ias_vals_ps_internal, tr_vals_ps)
-    V = IAS * 1.68781  # ft/s
-
-    omega_rad = TR * (np.pi / 180)
-    n = np.sqrt(1 + (V * omega_rad / g) ** 2)
-
-    q = 0.5 * rho * V**2
-    CD0 = ac.get("CD0", 0.025)
-    e = ac.get("e", 0.8)
-    AR = ac.get("aspect_ratio", 7.5)
-    CL = weight * n / (q * wing_area)
-    CD = CD0 + (CL**2) / (np.pi * e * AR)
-    D = q * wing_area * CD
-
-    # === Realistic Propeller Thrust Model ===
-    V_kts = IAS  # already in knots indicated
-    # === Refined Prop Thrust Model ===
-    V_max_kts = 160  # approximate top speed for full power
-    T_static = 2.6 * hp  # DA20-specific static thrust factor
-    V_fraction = np.clip(V_kts / V_max_kts, 0, 1)
-
-    T_available = T_static * (1 - V_fraction**2)
-    T_available = np.maximum(T_available, 0)
-
-    # Apply pitch correction here too
-    gamma_rad = np.radians(pitch_angle)
-    Ps = ((T_available - D) * V / weight - g * np.sin(gamma_rad)) / 1.68781
-
-    # Envelope mask
-    mask = np.ones_like(Ps, dtype=bool)
-    for i in range(len(tr_vals_ps)):
-        for j in range(len(ias_vals_ps_internal)):
-            ias = ias_vals_ps_internal[j]
-            tr = tr_vals_ps[i]
-            v_fts = ias * 1.68781
-            omega_rad = tr * (np.pi / 180)
-            n_val = np.sqrt(1 + (v_fts * omega_rad / g) ** 2)
-            stall_v_fts = np.sqrt((2 * weight * n_val) / (rho * wing_area * cl_max))
-            stall_ias = stall_v_fts / 1.68781
-            tr_limit_pos = g * np.sqrt(g_limit**2 - 1) / v_fts * 180 / np.pi
-            tr_limit_neg = g * np.sqrt(g_limit_neg**2 - 1) / v_fts * 180 / np.pi
-
-            if (
-                ias >= stall_ias and
-                (
-                    (tr >= 0 and tr <= tr_limit_pos) or
-                    (tr < 0 and abs(tr) <= tr_limit_neg)
-                ) and
-                ias <= max_speed
-            ):
-                mask[i, j] = False
-
-    Ps_masked = np.where(mask, np.nan, Ps)
-
+    
      # --- Dynamic Vmca Curve (bank angle vs adjusted Vmca + turn rate) ---
     if "vmca" in all_overlays and ac.get("engine_count", 1) > 1 and oei_active:
         published_vmca = ac.get("single_engine_limits", {}).get("Vmca", 70)
@@ -2378,24 +2341,32 @@ def update_graph(
                 xanchor="center"
             )
         
-# --- Dynamic Hover Template ---
+    # --- Dynamic Hover Template ---
     hover_ias = []
     hover_tr = []
     hover_aob = []
 
-    for i in range(len(tr_vals_ps)):
-        for j in range(len(ias_vals_ps_internal)):
-            if not np.isnan(Ps_masked[i, j]):
-                ias = ias_vals_ps_internal[j]   # use internal value
-                tr = tr_vals_ps[i]
-                v_fts = ias * 1.68781
-                omega_rad = tr * (np.pi / 180)
-                aob_deg = np.degrees(np.arctan(omega_rad * v_fts / g))
+    # Only build hover data if Ps grid exists / Ps overlay is enabled
+    if (
+        "ps" in overlay_toggle
+        and Ps_masked is not None
+        and tr_vals_ps is not None
+        and ias_vals_ps_internal is not None
+    ):
+        rows, cols = Ps_masked.shape
+        for i in range(rows):
+            for j in range(cols):
+                if not np.isnan(Ps_masked[i, j]):
+                    ias = ias_vals_ps_internal[j]   # use internal value
+                    tr = tr_vals_ps[i]
+                    v_fts = ias * 1.68781
+                    omega_rad = tr * (np.pi / 180)
+                    aob_deg = np.degrees(np.arctan(omega_rad * v_fts / g))
 
-                display_ias = convert_display_airspeed(ias, unit)  # convert only for x-axis display
-                hover_ias.append(display_ias)
-                hover_tr.append(tr)
-                hover_aob.append(aob_deg)
+                    display_ias = convert_display_airspeed(ias, unit)  # convert only for x-axis display
+                    hover_ias.append(display_ias)
+                    hover_tr.append(tr)
+                    hover_aob.append(aob_deg)
 
     # Determine hover template
     if "aob" in overlay_toggle:
