@@ -4,23 +4,8 @@ import json
 import os
 from dash.exceptions import PreventUpdate
 
-def load_aircraft_data_from_folder():
-    folder_path = os.path.join(os.path.dirname(__file__), "aircraft_data")
-    aircraft_data = {}
-    for filename in os.listdir(folder_path):
-        if filename.endswith(".json"):
-            filepath = os.path.join(folder_path, filename)
-            with open(filepath, "r") as f:
-                try:
-                    data = json.load(f)
-                    name = os.path.splitext(filename)[0].replace("_", " ")
-                    aircraft_data[name] = data
-                except Exception as e:
-                    print(f"[ERROR] Failed to load {filename}: {e}")
-    return aircraft_data
-
-# ✅ Load it once for this page
-aircraft_data = load_aircraft_data_from_folder()
+# Import shared aircraft data from core module
+from core import AIRCRAFT_DATA, aircraft_data
 
 # --- Full Edit Aircraft Page Layout ---
 def edit_aircraft_layout():

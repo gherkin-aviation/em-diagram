@@ -1,3 +1,17 @@
+# =============================================================================
+# EM Diagram Generator - Main Application
+# =============================================================================
+"""
+Energy Maneuverability Diagram Generator
+Visualization tool for aircraft performance analysis.
+
+Module structure:
+- core/           Physics calculations, constants, data loading
+- pages/          Page layouts (future)
+- callbacks/      Dash callbacks (future)
+- components/     Reusable UI components (future)
+"""
+
 import dash
 from dash import dcc, html, Input, Output, State, ctx
 from dash.dependencies import ALL
@@ -5,84 +19,58 @@ import plotly.graph_objects as go
 import numpy as np
 import webbrowser
 import threading
-from edit_aircraft_page import edit_aircraft_layout
-import copy 
-from dash import ctx
+import copy
+import time
+import sys
+import os
+import json
+from itertools import zip_longest
 from dash.exceptions import PreventUpdate
-from core.calculations import (
+
+# Import from modular core package
+from core import (
+    # App settings
+    DEBUG_LOG,
+    dprint,
+    # Physical constants
+    g, G_FT_S2, KTS_TO_FPS, FPS_TO_KTS, KTS_TO_MPH, RHO_SL, TEMP_SL_K, TEMP_SL_C, LAPSE_RATE_K_FT,
+    # Drag/Lift calculations
     compute_dynamic_pressure,
     compute_cl,
     compute_cd,
     compute_drag,
     compute_thrust_available,
     compute_ps_knots_per_sec,
+    # Atmosphere
+    compute_air_density,
+    compute_density_altitude,
+    compute_pressure_altitude,
+    compute_true_airspeed,
+    # Turn physics
+    compute_load_factor,
+    compute_turn_rate_from_bank,
+    compute_turn_rate_from_load_factor,
+    compute_turn_radius,
+    compute_bank_from_turn_rate,
+    # Stall
+    compute_stall_speed_at_load_factor,
+    interpolate_stall_speed,
+    # Aircraft data
+    AIRCRAFT_DATA,
+    aircraft_data,
+    extract_vmca_value,
+    resource_path,
+    # Airport data
+    AIRPORT_DATA,
+    AIRPORT_OPTIONS,
+    get_airport_by_id,
 )
-import time
 
-# Toggle for console debug logging
-DEBUG_LOG = False  # set to False before deploying to Render
-
-
-def dprint(*args, **kwargs):
-    """Debug print that can be globally toggled."""
-    if DEBUG_LOG:
-        print(*args, **kwargs)
-
-
-
-# ✅ Load aircraft data FIRST
-import sys
-import os
-import json
-from itertools import zip_longest
-
-def load_aircraft_data_from_folder():
-    folder_path = os.path.join(os.path.dirname(__file__), "aircraft_data")
-    aircraft_data = {}
-    for filename in os.listdir(folder_path):
-        if filename.endswith(".json"):
-            filepath = os.path.join(folder_path, filename)
-            with open(filepath, "r") as f:
-                try:
-                    data = json.load(f)
-                    name = os.path.splitext(filename)[0].replace("_", " ")
-                    aircraft_data[name] = data
-                except Exception as e:
-                    dprint(f"[ERROR] Failed to load {filename}: {e}")
-    return aircraft_data
-print("[BOOT] Loading aircraft data from folder once...")
-AIRCRAFT_DATA = load_aircraft_data_from_folder()
-print(f"[BOOT] Loaded {len(AIRCRAFT_DATA)} aircraft")
-
-class DynamicAircraftData:
-    """
-    Lightweight wrapper around the boot-time AIRCRAFT_DATA dict.
-    No disk I/O on access.
-    """
-    def __getitem__(self, key):
-        return AIRCRAFT_DATA[key]
-
-    def get(self, key, default=None):
-        return AIRCRAFT_DATA.get(key, default)
-
-    def __contains__(self, key):
-        return key in AIRCRAFT_DATA
-
-aircraft_data = DynamicAircraftData()
-
-def resource_path(filename):
-    if hasattr(sys, '_MEIPASS'):
-        return os.path.join(sys._MEIPASS, filename)
-    return filename
-
-def extract_vmca_value(ac, preferred="clean_up"):
-    vmca = ac.get("single_engine_limits", {}).get("Vmca", {})
-    if isinstance(vmca, dict):
-        return vmca.get(preferred) or next(iter(vmca.values()), None)
-    return vmca if isinstance(vmca, (int, float)) else None
+from edit_aircraft_page import edit_aircraft_layout
+import dash_bootstrap_components as dbc
 
 # ✅ Initialize Dash app
-app = dash.Dash(__name__, suppress_callback_exceptions=True)
+app = dash.Dash(__name__, suppress_callback_exceptions=True, external_stylesheets=[dbc.themes.BOOTSTRAP])
 server = app.server
 
 
@@ -119,9 +107,92 @@ app.layout = html.Div([
     dcc.Store(id="last-saved-aircraft"),
     dcc.Store(id="stored-total-weight"),
     dcc.Store(id="screen-width"),
+    dcc.Store(id="sidebar-collapsed", data=False),
     html.Div(id="page-content"),
-    dcc.Download(id="download-aircraft")
-    
+    dcc.Download(id="download-aircraft"),
+
+    # Global Modals (shared between desktop and mobile)
+    dbc.Modal([
+        dbc.ModalHeader(dbc.ModalTitle("AeroEdge Disclaimer"), close_button=True),
+        dbc.ModalBody([
+            html.P("This tool supplements—not replaces—FAA-published documentation.", style={"marginBottom": "8px"}),
+            html.P("It is intended for educational and reference use only, and has not been approved or endorsed by the Federal Aviation Administration (FAA).", style={"marginBottom": "8px"}),
+            html.P("While AeroEdge is aligned with FAA safety principles, it is not an official source of operational data. Users must consult certified instructors and approved aircraft documentation when making flight decisions.", style={"marginBottom": "8px"}),
+            html.P("The data presented may be incomplete, inaccurate, outdated, or derived from public or user-submitted sources. No warranties, express or implied, are made regarding its accuracy, completeness, or fitness for purpose.", style={"marginBottom": "8px"}),
+            html.P("Instructors and users are encouraged to verify all EM diagram outputs against certified POH/AFM values. This tool is not a substitute for competent flight instruction, or for compliance with applicable regulations, including Airworthiness Directives (ADs), Federal Aviation Regulations (FARs), or Advisory Circulars (ACs).", style={"marginBottom": "8px"}),
+            html.P("If any information conflicts with the aircraft's FAA-approved AFM or POH, the official documentation shall govern.", style={"marginBottom": "8px"}),
+            html.P("AeroEdge disclaims all liability for errors, omissions, injuries, or damages resulting from the use of this application or website. Use of this tool constitutes acceptance of these terms.", style={"marginBottom": "8px"})
+        ]),
+        dbc.ModalFooter(
+            dbc.Button("Close", id="close-disclaimer", className="ms-auto", color="secondary")
+        )
+    ], id="disclaimer-modal", is_open=False, centered=True, size="lg"),
+
+    dbc.Modal([
+        dbc.ModalHeader(dbc.ModalTitle("Terms of Use & Privacy Policy"), close_button=True),
+        dbc.ModalBody([
+            html.H6("Terms of Use", className="mb-2 mt-2"),
+            html.P("By accessing or using the AeroEdge application and its associated services, you agree to use this tool solely for educational and informational purposes. This tool is not FAA-certified and should not be relied upon for flight planning, aircraft operation, or regulatory compliance.", style={"marginBottom": "8px"}),
+            html.P("Users must verify all performance data with the aircraft's official Pilot's Operating Handbook (POH) or Aircraft Flight Manual (AFM). Use of AeroEdge is at your own risk. AeroEdge disclaims liability for any direct, indirect, incidental, or consequential damages arising from its use.", style={"marginBottom": "8px"}),
+            html.H6("Privacy Policy", className="mb-2 mt-4"),
+            html.P("AeroEdge does not collect, store, or share any personally identifiable information (PII). All use of the application is anonymous. Uploaded aircraft files remain local to your device and are not transmitted or stored on any external servers.", style={"marginBottom": "8px"}),
+            html.P("If you submit feedback through linked forms, that information is governed by the terms of Google Forms. AeroEdge does not sell or distribute any user-submitted information and uses it only to improve functionality and user experience.", style={"marginBottom": "8px"}),
+            html.P("By using this application, you acknowledge and accept these terms.")
+        ]),
+        dbc.ModalFooter(
+            dbc.Button("Close", id="close-terms-policy", className="ms-auto", color="secondary")
+        )
+    ], id="terms-policy-modal", is_open=False, centered=True, size="lg"),
+
+    # Quick Start Modal
+    dbc.Modal([
+        dbc.ModalHeader(dbc.ModalTitle("Quick Start Guide"), close_button=True),
+        dbc.ModalBody([
+            html.P([
+                html.Strong("What is an EM Diagram? "),
+                "An Energy-Maneuverability diagram visualizes your aircraft's performance envelope—showing the relationship between airspeed, load factor (G), and turn rate at any given configuration."
+            ], style={"marginBottom": "8px"}),
+            html.P([
+                html.Strong("Why it matters: "),
+                "Understanding these limits is critical for safe and effective flight training:"
+            ], style={"marginBottom": "6px"}),
+            html.Ul([
+                html.Li([html.Strong("Stall/Spin Training: "), "See exactly how stall speed increases with bank angle and G-load"]),
+                html.Li([html.Strong("Steep Turns: "), "Visualize the energy cost of maintaining altitude in 45°+ banks"]),
+                html.Li([html.Strong("Emergency Maneuvers: "), "Know your corner speed and maximum instantaneous turn rate"]),
+                html.Li([html.Strong("Multi-Engine: "), "Understand Vmc variations with weight, altitude, and configuration"]),
+                html.Li([html.Strong("CFI/CFII Instruction: "), "Demonstrate performance concepts with real aircraft data"]),
+            ], style={"paddingLeft": "20px", "marginBottom": "10px", "fontSize": "13px"}),
+            html.Hr(style={"margin": "10px 0"}),
+            html.P(html.Strong("Getting Started:"), style={"marginBottom": "6px"}),
+            html.Ol([
+                html.Li("Select an aircraft or load a custom JSON file"),
+                html.Li("Adjust weight, altitude, and power settings"),
+                html.Li("Toggle overlays (Ps contours, G-lines, turn radius, etc.)"),
+                html.Li("Hover over the graph for detailed values"),
+                html.Li("Export with PNG/PDF buttons"),
+            ], style={"paddingLeft": "20px", "marginBottom": "10px", "fontSize": "13px"}),
+            html.Hr(style={"margin": "10px 0"}),
+            html.P([
+                html.Strong("Tip: "),
+                "Click the ", html.Span("?", style={"backgroundColor": "#2980B9", "color": "white", "borderRadius": "50%", "padding": "1px 5px", "fontSize": "10px"}),
+                " icons next to any option for detailed explanations."
+            ], style={"marginBottom": "0", "fontSize": "13px"})
+        ]),
+        dbc.ModalFooter(
+            dbc.Button("Close", id="close-readme", className="ms-auto", color="secondary")
+        )
+    ], id="readme-modal", is_open=False, centered=True, size="lg"),
+
+    # Help Modal for feature explanations
+    dcc.Store(id="help-topic", data=None),
+    dbc.Modal([
+        dbc.ModalHeader(dbc.ModalTitle(id="help-modal-title"), close_button=True),
+        dbc.ModalBody(id="help-modal-body"),
+        dbc.ModalFooter(
+            dbc.Button("Close", id="close-help-modal", className="ms-auto", color="secondary")
+        )
+    ], id="help-modal", is_open=False, centered=True, size="lg"),
 ])
 
 # Define clientside JS callback to detect screen width
@@ -135,9 +206,20 @@ app.clientside_callback(
     Input("url", "pathname")
 )
 
+# Callback to forward ghost help trigger clicks to the hidden help-ghost element
+@app.callback(
+    Output("help-ghost", "n_clicks"),
+    Input({"type": "ghost-help-trigger", "index": ALL}, "n_clicks"),
+    State("help-ghost", "n_clicks"),
+    prevent_initial_call=True
+)
+def forward_ghost_help_clicks(trigger_clicks, current_clicks):
+    """Forward clicks from dynamic ghost help triggers to the static help-ghost element."""
+    if trigger_clicks and any(c and c > 0 for c in trigger_clicks):
+        return (current_clicks or 0) + 1
+    raise PreventUpdate
 
-import dash_bootstrap_components as dbc
-from dash import dcc, html, Input, Output, State, ctx, ALL
+
 
 # === Redesigned Layout with Original IDs Preserved ===
 def em_diagram_layout(is_mobile=False):
@@ -158,740 +240,560 @@ def desktop_layout():
                 ], className="banner-inner")
             ], className="banner-header"),
 
-            # Disclaimer Banner for EM Diagram Page
+            # Warning Banner
             html.Div(
-                "⚠️ This tool visualizes performance data based on public or user-submitted values and is for educational use only. "
-                "It is not FAA-approved and may not reflect actual aircraft capabilities. Always verify against the aircraft's POH/AFM. ⚠️",
-                style={
-                    "backgroundColor": "#fff3cd",
-                    "border": "1px solid #ffeeba",
-                    "padding": "10px 20px",
-                    "fontSize": "13px",
-                    "color": "#856404",
-                    "marginBottom": "10px",
-                    "textAlign": "center",
-                    "fontWeight": "500"
-                }
+                "\u26a0\ufe0f This tool visualizes performance data based on public or user-submitted values and is for educational use only. It is not FAA-approved and may not reflect actual aircraft capabilities. Always verify against the aircraft's POH/AFM. \u26a0\ufe0f",
+                className="warning-banner"
             ),
 
-            # Legal Links Row
+            # Quick Links Bar
             html.Div([
-                html.Div([
-                    html.A("Full Legal Disclaimer", href="#", id="open-disclaimer", style={
-                        "fontSize": "13px",
-                        "textDecoration": "underline",
-                        "color": "#007bff",
-                        "cursor": "pointer"
-                    }),
-                    html.Span(" | ", style={"margin": "0 6px", "color": "#999"}),  # optional separator
-                    html.A("Terms of Use & Privacy Policy", href="#", id="open-terms-policy", style={
-                        "fontSize": "13px",
-                        "textDecoration": "underline",
-                        "color": "#007bff",
-                        "cursor": "pointer"
-                    }),
-                ], style={
-                    "display": "flex",
-                    "justifyContent": "center",
-                    "alignItems": "center",
-                    "gap": "10px",
-                    "margin": "4px 0 0 0",
-                    "padding": "0",
-                    "lineHeight": "1.2"
-                }),
-
-                # Disclaimer Modal
-                dbc.Modal([
-                    dbc.ModalHeader("AeroEdge Disclaimer", close_button=False),
-                    dbc.ModalBody([
-                        html.P("This tool supplements—not replaces—FAA-published documentation.", style={"marginBottom": "8px"}),
-                        html.P("It is intended for educational and reference use only, and has not been approved or endorsed by the Federal Aviation Administration (FAA).", style={"marginBottom": "8px"}),
-                        html.P("While AeroEdge is aligned with FAA safety principles, it is not an official source of operational data. Users must consult certified instructors and approved aircraft documentation when making flight decisions.", style={"marginBottom": "8px"}),
-                        html.P("The data presented may be incomplete, inaccurate, outdated, or derived from public or user-submitted sources. No warranties, express or implied, are made regarding its accuracy, completeness, or fitness for purpose.", style={"marginBottom": "8px"}),
-                        html.P("Instructors and users are encouraged to verify all EM diagram outputs against certified POH/AFM values. This tool is not a substitute for competent flight instruction, or for compliance with applicable regulations, including Airworthiness Directives (ADs), Federal Aviation Regulations (FARs), or Advisory Circulars (ACs).", style={"marginBottom": "8px"}),
-                        html.P("If any information conflicts with the aircraft’s FAA-approved AFM or POH, the official documentation shall govern.", style={"marginBottom": "8px"}),
-                        html.P("AeroEdge disclaims all liability for errors, omissions, injuries, or damages resulting from the use of this application or website. Use of this tool constitutes acceptance of these terms.", style={"marginBottom": "8px"})
-                    ]),
-                    dbc.ModalFooter(
-                        dbc.Button("Close", id="close-disclaimer", className="ms-auto", color="secondary")
-                    )
-                ], id="disclaimer-modal", is_open=False),
-
-                # Terms Modal
-                dbc.Modal([
-                    dbc.ModalHeader("Terms of Use & Privacy Policy", close_button=False),
-                    dbc.ModalBody([
-                        html.H6("Terms of Use", className="mb-2 mt-2"),
-                        html.P("By accessing or using the AeroEdge application and its associated services, you agree to use this tool solely for educational and informational purposes. This tool is not FAA-certified and should not be relied upon for flight planning, aircraft operation, or regulatory compliance.", style={"marginBottom": "8px"}),
-                        html.P("Users must verify all performance data with the aircraft's official Pilot's Operating Handbook (POH) or Aircraft Flight Manual (AFM). Use of AeroEdge is at your own risk. AeroEdge disclaims liability for any direct, indirect, incidental, or consequential damages arising from its use.", style={"marginBottom": "8px"}),
-
-                        html.H6("Privacy Policy", className="mb-2 mt-4"),
-                        html.P("AeroEdge does not collect, store, or share any personally identifiable information (PII). All use of the application is anonymous. Uploaded aircraft files remain local to your device and are not transmitted or stored on any external servers.", style={"marginBottom": "8px"}),
-                        html.P("If you submit feedback through linked forms, that information is governed by the terms of Google Forms. AeroEdge does not sell or distribute any user-submitted information and uses it only to improve functionality and user experience.", style={"marginBottom": "8px"}),
-
-                        html.P("By using this application, you acknowledge and accept these terms.")
-                    ]),
-                    dbc.ModalFooter(
-                        dbc.Button("Close", id="close-terms-policy", className="ms-auto", color="secondary")
-                    )
-                ], id="terms-policy-modal", is_open=False),
-            ]),
+                html.Span("Quick Start", id="open-readme", className="quick-link link-blue", style={"cursor": "pointer"}),
+                html.Span("|", className="separator"),
+                html.A("Report Issue", href="https://forms.gle/1xP29PwFze5MHCTZ7", target="_blank", className="quick-link link-danger"),
+                html.Span("|", className="separator"),
+                html.A("Contact AeroEdge", href="https://forms.gle/AqS1uuTgcY6sRHob9", target="_blank", className="quick-link link-blue"),
+                html.Span("|", className="separator"),
+                html.A("Maneuver Overlay Tool", href="https://overlay.flyaeroedge.com", target="_blank", className="quick-link link-orange"),
+            ], className="quick-links-bar-slim"),
 
         # Two-Column Flex Layout: Sidebar + Graph
         html.Div([
             # Sidebar Left
             dbc.Col([
                 html.Div(id="resize-handle", className="resize-handle"),
-                html.Div("EM Diagram Generator", style={
-                    "fontWeight": "600",
-                    "fontSize": "20px",
-                    "marginBottom": "10px",
-                    "color": "#1b1e23"  # match your theme color
-                }),
+                # Sidebar header with collapse button
+                html.Div([
+                    html.Div("EM Diagram Generator", style={
+                        "fontWeight": "600",
+                        "fontSize": "18px",
+                        "color": "#1b1e23"
+                    }),
+                    html.Button("«", id="sidebar-collapse-btn", className="sidebar-collapse-btn", title="Collapse sidebar"),
+                ], className="sidebar-header"),
                 dbc.Row([
                     dbc.Col(
                         dbc.Button(
-                            "✏️ Edit / Create Aircraft",
+                            "Edit / Create Aircraft",
                             id="edit-aircraft-button",
-                            color="success",
-                            className="mb-2",
-                            style={"width": "200px", "fontWeight": "bold"}
-                        ),
-                        
+                            className="btn-standard btn-primary-orange w-100",
+                        ), width=6
                     ),
                     dbc.Col(
                         dcc.Upload(
                             id="upload-aircraft",
                             children=dbc.Button(
-                                "📂 Load Aircraft File",
-                                color="info",
-                                style={"fontWeight": "bold"}
+                                "Load Aircraft File",
+                                className="btn-standard btn-primary-orange w-100",
                             ),
                             multiple=False,
-                            accept=".json"
-                        ),
-                        
+                            accept=".json",
+                            className="w-100"
+                        ), width=6
                     )
-                ], className="mb-2", style={"gap": "10px"}),
+                ], className="mb-2 g-1"),
 
-                # Aircraft Configuration Panel
-                dbc.Card([
-                    dbc.CardHeader("Aircraft Configuration"),
-                    dbc.CardBody([
-                        dbc.Row([
-                            dbc.Col([
-                                html.Label("Aircraft", className="input-label"),
-                                dcc.Dropdown(id="aircraft-select", options=[], placeholder="Select an Aircraft...", className="dropdown")
-                            ])
-                        ], className="mb-3"),
-
-                        dbc.Row([
-                            dbc.Col([
-                                html.Label("Engine", className="input-label"),
+                # Accordion Sections
+                dbc.Accordion([
+                    # Aircraft Configuration
+                    dbc.AccordionItem([
+                        html.Div([
+                            html.Label("Aircraft", className="input-label-sm"),
+                            dcc.Dropdown(id="aircraft-select", options=[], placeholder="Select an Aircraft...", className="dropdown")
+                        ], className="mb-2"),
+                        # Hidden until aircraft is selected
+                        html.Div([
+                            html.Div([
+                                html.Label("Engine", className="input-label-sm"),
                                 dcc.Dropdown(id="engine-select", className="dropdown"),
-                                
-                            ])
-                        ], className="mb-3"),
-
-                        dbc.Row([
-                            dbc.Col([
-                                html.Label("Category", className="input-label"),
+                            ], className="mb-2"),
+                            html.Div([
+                                html.Label("Category", className="input-label-sm"),
                                 dcc.Dropdown(id="category-select", className="dropdown")
-                            ])
-                        ], className="mb-3"),
-
-                        dbc.Row([
-                            dbc.Col([
-                                html.Label("Flap Configuration", className="input-label"),
+                            ], className="mb-2"),
+                            html.Div([
+                                html.Label("Flap Configuration", className="input-label-sm"),
                                 dcc.Dropdown(id="config-select", className="dropdown")
-                            ])
-                        ], className="mb-3"),
-
-                        dbc.Row([
-                            dbc.Col([
-                                html.Label("Landing Gear", className="input-label"),
+                            ], className="mb-2"),
+                            html.Div([
+                                html.Label("Landing Gear", className="input-label-sm"),
                                 dcc.Dropdown(id="gear-select", className="dropdown")
-                            ])
-                        ], className="mb-3"),
-
-                        dbc.Row([
-                            dbc.Col([
-                                html.Label("Total Weight", className="input-label"),
+                            ], id="gear-select-container", className="mb-2", style={"display": "none"}),
+                            html.Div([
+                                html.Label("Total Weight", className="input-label-sm"),
                                 html.Div(id="total-weight-display", className="weight-box")
-                            ])
-                        ], className="mb-3"),
-
-                        dbc.Row([
-                            dbc.Col([
-                                html.Label("Occupants", className="input-label"),
-                                dcc.Dropdown(id="occupants-select", className="dropdown-small")
-                            ], width=6),
-                            dbc.Col([
-                                html.Label("Occupant Weight (lbs)", className="input-label"),
-                                dcc.Input(id="passenger-weight-input", type="number", value=180, min=50, max=400, step=1, className="input-small")
-                            ], width=6)
-                        ], className="mb-3"),
-
-                        
-                        dbc.Row([
-                            dbc.Col([
-                                html.Label("Fuel (gal)", className="input-label"),
+                            ], className="mb-2"),
+                            dbc.Row([
+                                dbc.Col([
+                                    html.Label("Occupants", className="input-label-sm"),
+                                    dcc.Dropdown(id="occupants-select", className="dropdown-small")
+                                ], width=6),
+                                dbc.Col([
+                                    html.Label("Occ. Weight", className="input-label-sm"),
+                                    dcc.Input(id="passenger-weight-input", type="number", value=180, min=50, max=400, step=1, className="input-small")
+                                ], width=6)
+                            ], className="mb-2"),
+                            html.Div([
+                                html.Label("Fuel (gal)", className="input-label-sm"),
                                 dcc.Slider(id="fuel-slider", min=0, max=50, step=1, value=20, marks={}, tooltip={"always_visible": True})
-                            ])
-                        ], className="mb-3"),
-
-                        dbc.Row([
-                            dbc.Col([
-                                html.Label("Power Setting", className="input-label"),
+                            ], className="mb-2"),
+                            html.Div([
+                                html.Label("Power Setting", className="input-label-sm"),
                                 dcc.Slider(
                                     id="power-setting",
-                                    min=0.05,
-                                    max=1.0,
-                                    step=0.05,
-                                    value=0.50,
+                                    min=0.05, max=1.0, step=0.05, value=0.50,
                                     marks={0.05: "IDLE", 0.2: "20%", 0.4: "40%", 0.6: "60%", 0.8: "80%", 1: "100%"},
                                     tooltip={"always_visible": True}
                                 )
-                            ])
-                        ], className="mb-3"),
-
-                        html.Div([
-                            dcc.Slider(id="cg-slider", min=0, max=1, value=0.5, step=0.01)
-                        ], id="cg-slider-container"),
-
-                        dbc.Row([
-                            dbc.Col([
-                                html.Label("Altitude (ft)", className="input-label"),
-                                dcc.Slider(id="altitude-slider", min=0, max=35000, step=1000, value=0, marks={}, tooltip={"always_visible": True})
-                            ])
-                        ], className="mb-3"),
-
-                        dbc.Row([
-                            dbc.Col([
-                                html.Label("Flight Path Angle (deg)", className="input-label"),
+                            ], className="mb-2"),
+                            html.Div([
+                                dcc.Slider(id="cg-slider", min=0, max=1, value=0.5, step=0.01)
+                            ], id="cg-slider-container", className="mb-2"),
+                            html.Div([
+                                html.Div([
+                                    html.Label("Flight Path Angle (deg)", className="input-label-sm"),
+                                    html.Span("?", id="help-fpa", className="help-icon", n_clicks=0)
+                                ], style={"display": "flex", "alignItems": "center"}),
                                 dcc.Slider(
                                     id="pitch-angle",
-                                    min=-15,
-                                    max=25,
-                                    step=1,
-                                    value=0,
+                                    min=-15, max=25, step=1, value=0,
                                     marks={-15: "-15°", -10: "-10°", -5: "-5°", 0: "0°", 5: "5°", 10: "10°", 15: "15°", 20: "20°", 25: "25°"},
                                     tooltip={"always_visible": True}
                                 )
-                            ])
-                        ], className="mb-3")
-                    ])
-                ], className="mb-4"),
+                            ], className="mb-2")
+                        ], id="config-details", style={"display": "none"})
+                    ], title="Aircraft Configuration", item_id="config"),
 
-                # Overlay & Units
-                dbc.Card([
-                    dbc.CardHeader("Overlay Options"),
-                    dbc.CardBody([
-
-                        # Airspeed Units Toggle
+                    # Environment
+                    dbc.AccordionItem([
                         html.Div([
-                            html.Label("Airspeed Units", className="input-label", style={"marginBottom": "6px"}),
-                            dbc.RadioItems(
-                                id="unit-select",
-                                options=[
-                                    {"label": "KIAS", "value": "KIAS"},
-                                    {"label": "MPH", "value": "MPH"}
-                                ],
-                                value="KIAS",
-                                inline=True,
-                                
+                            html.Label("Airport", className="input-label-sm"),
+                            dcc.Dropdown(
+                                id="airport-select",
+                                options=AIRPORT_OPTIONS,
+                                placeholder="Search airport...",
+                                searchable=True,
+                                clearable=True,
+                                style={"fontSize": "12px"}
                             )
-                        ], className="radio-inline-group"),
-
-                        # Overlay checklist (always visible)
-                        dcc.Checklist(
-                            id="overlay-toggle",
-                            options=[
-                                {"label": "Ps Contours", "value": "ps"},
-                                {"label": "Intermediate G Lines", "value": "g"},
-                                {"label": "Turn Radius Lines", "value": "radius"},
-                                {"label": "Angle of Bank Shading", "value": "aob"},
-                                {"label": "Negative G Envelope", "value": "negative_g"}
-                            ],
-                            value=["g", "radius", "aob"],
-                            labelStyle={"display": "block"},
-                            className="checklist mb-3"
-                        ),
+                        ], className="mb-2"),
                         html.Div([
-                            html.Label("Engine Failure Simulation", className="input-label"),
-                            dcc.Checklist(
+                            html.Label("Altitude (ft MSL)", className="input-label-sm"),
+                            dcc.Slider(id="altitude-slider", min=0, max=35000, step=500, value=0, marks={}, tooltip={"always_visible": True})
+                        ], className="mb-2"),
+                        dbc.Row([
+                            dbc.Col([
+                                html.Label("OAT (°C)", className="input-label-sm"),
+                                dcc.Input(id="oat-input", type="number", value=15, min=-50, max=50, step=1, className="input-small", style={"width": "100%"})
+                            ], width=3),
+                            dbc.Col([
+                                html.Label("OAT (°F)", className="input-label-sm"),
+                                dcc.Input(id="oat-fahrenheit-display", type="text", value="59", disabled=True, className="input-small", style={"width": "100%", "backgroundColor": "#f5f5f5"})
+                            ], width=3),
+                            dbc.Col([
+                                html.Label("Altimeter", className="input-label-sm"),
+                                dcc.Input(id="altimeter-input", type="number", value=29.92, min=28.0, max=31.0, step=0.01, className="input-small", style={"width": "100%"})
+                            ], width=6)
+                        ], className="mb-2"),
+                        html.Div([
+                            html.Div(id="pa-da-display", className="pa-da-box", children=[
+                                html.Span("PA: 0 ft | DA: 0 ft", style={"fontSize": "11px", "color": "#666"})
+                            ])
+                        ], className="mb-2"),
+                    ], title="Environment", item_id="environment"),
+
+                    # Overlay Options
+                    dbc.AccordionItem([
+                        html.Div([
+                            html.Label("Airspeed Units", className="input-label-sm", style={"marginRight": "10px"}),
+                            dbc.ButtonGroup([
+                                dbc.Button("KIAS", id="btn-kias", className="segment-btn active", n_clicks=0),
+                                dbc.Button("MPH", id="btn-mph", className="segment-btn", n_clicks=0),
+                            ], className="segment-control"),
+                            dcc.Store(id="unit-select", data="KIAS"),
+                        ], className="mb-2 d-flex align-items-center"),
+                        # Overlay toggles with help icons
+                        html.Div([
+                            html.Div([
+                                html.Div([
+                                    html.Span("Ps Contours", className="overlay-label"),
+                                    html.Span("?", id="help-ps", className="help-icon", n_clicks=0)
+                                ], className="label-group"),
+                                dbc.Switch(id="toggle-ps", value=False, className="form-switch")
+                            ], className="overlay-row"),
+                            html.Div([
+                                html.Div([
+                                    html.Span("Intermediate G Lines", className="overlay-label"),
+                                    html.Span("?", id="help-g", className="help-icon", n_clicks=0)
+                                ], className="label-group"),
+                                dbc.Switch(id="toggle-g", value=True, className="form-switch")
+                            ], className="overlay-row"),
+                            html.Div([
+                                html.Div([
+                                    html.Span("Turn Radius Lines", className="overlay-label"),
+                                    html.Span("?", id="help-radius", className="help-icon", n_clicks=0)
+                                ], className="label-group"),
+                                dbc.Switch(id="toggle-radius", value=True, className="form-switch")
+                            ], className="overlay-row"),
+                            html.Div([
+                                html.Div([
+                                    html.Span("Angle of Bank Shading", className="overlay-label"),
+                                    html.Span("?", id="help-aob", className="help-icon", n_clicks=0)
+                                ], className="label-group"),
+                                dbc.Switch(id="toggle-aob", value=True, className="form-switch")
+                            ], className="overlay-row"),
+                            html.Div([
+                                html.Div([
+                                    html.Span("Negative G Envelope", className="overlay-label"),
+                                    html.Span("?", id="help-negative-g", className="help-icon", n_clicks=0)
+                                ], className="label-group"),
+                                dbc.Switch(id="toggle-negative-g", value=False, className="form-switch")
+                            ], className="overlay-row"),
+                        ], className="mb-2"),
+                        # Hidden store to maintain compatibility with existing callbacks
+                        dcc.Store(id="overlay-toggle", data=["g", "radius", "aob"]),
+                        html.Div([
+                            html.Label("Engine Failure Simulation", className="input-label-sm"),
+                            dbc.Checklist(
                                 id="oei-toggle",
                                 options=[{"label": "Simulate One Engine Inoperative", "value": "enabled"}],
                                 value=[],
-                                style={"marginBottom": "5px"},
+                                switch=True,
+                                className="switch-list"
                             )
-                        ], id="oei-container", className="mb-3"),
-                        # OEI toggle (Simulate One Engine Inoperative)
-                        html.Div(id="oei-container", className="mb-3"),
-
-                        # Dynamic Vmc / Vyse Checklist (conditionally shown)
+                        ], id="oei-container", className="mb-2"),
                         html.Div([
-                            dcc.Checklist(
-                                id="multi-engine-toggle-options",
-                                options=[
-                                    {"label": "Dynamic Vmc", "value": "vmca"},
-                                    {"label": "Dynamic Vyse", "value": "dynamic_vyse"}
-                                ],
-                                value=[],
-                                labelStyle={"display": "block"}
-                            )
-                        ], id="multi-engine-toggles", style={"display": "none"}, className="mb-3"),
-
-                        
-                        # === Prop Condition (only for Dynamic Vmc) ===
+                            html.Div([
+                                html.Div([
+                                    html.Span("Dynamic Vmc", className="overlay-label"),
+                                    html.Span("?", id="help-dvmc", className="help-icon", n_clicks=0)
+                                ], className="label-group"),
+                                dbc.Switch(id="toggle-vmca", value=False, className="form-switch")
+                            ], className="overlay-row"),
+                            html.Div([
+                                html.Div([
+                                    html.Span("Dynamic Vyse", className="overlay-label"),
+                                    html.Span("?", id="help-dvyse", className="help-icon", n_clicks=0)
+                                ], className="label-group"),
+                                dbc.Switch(id="toggle-vyse", value=False, className="form-switch")
+                            ], className="overlay-row"),
+                        ], id="multi-engine-toggles", style={"display": "none"}, className="mb-2"),
+                        # Hidden store for multi-engine options
+                        dcc.Store(id="multi-engine-toggle-options", data=[]),
                         html.Div([
-                            html.Label("Propeller Condition", className="input-label"),
-                            dcc.RadioItems(
-                                id="prop-condition",
-                                options=[
-                                    {"label": "Feathered", "value": "feathered"},
-                                    {"label": "Stationary", "value": "stationary"},
-                                    {"label": "Windmilling", "value": "windmilling"}                                    
-                                ],
-                                value="feathered",
-                                labelStyle={"display": "inline-block", "margin-right": "10px"}
-                            )
+                            html.Label("Propeller Condition", className="input-label-sm", style={"marginBottom": "6px"}),
+                            dbc.ButtonGroup([
+                                dbc.Button("Feathered", id="btn-feathered", className="segment-btn active", n_clicks=0),
+                                dbc.Button("Stationary", id="btn-stationary", className="segment-btn", n_clicks=0),
+                                dbc.Button("Windmilling", id="btn-windmilling", className="segment-btn", n_clicks=0),
+                            ], className="segment-control"),
+                            dcc.Store(id="prop-condition", data="feathered"),
                         ], id="prop-condition-container", style={"display": "none"})
-                    ])
-                ], className="mb-4"),
+                    ], title="Overlay Options", item_id="overlays"),
 
-                # Maneuver Builder
-                dbc.Card([
-                    dbc.CardHeader("Maneuver Overlays"),
-                    dbc.CardBody([
-                        dbc.Row([
-                            dbc.Col([
-                                html.Label("Maneuver", className="input-label"),
-                                dcc.Dropdown(
-                                    id="maneuver-select", className="dropdown",
-                                    options=[
-                                        {"label": "Steep Turn", "value": "steep_turn"},
-                                        {"label": "Chandelle", "value": "chandelle"}
-                                    ],
-                                    placeholder="Select a Maneuver",
-                                    style={"width": "100%"}
-                                )
-                            ])
-                        ], className="mb-3"),
-
-                        dbc.Row([
-                            dbc.Col(html.Div(id="maneuver-options-container"))
-                        ])
-                    ])
-                ], className="mb-4"),
-
-                # Export
-                dbc.Card([
-                    dbc.CardHeader("Export as PNG (use 📷 icon on graph)"),
-                    dbc.CardBody([
+                    # Maneuver Overlays
+                    dbc.AccordionItem([
                         html.Div([
-                            dbc.Button("Export as PDF", id="pdf-button", color="primary", className="me-2"),
-                        ], style={"display": "flex", "gap": "10px"}),
-                        dcc.Download(id="pdf-download")
-                    ])
-                ]),
-                # Error Reporting + Contact AeroEdge (Side-by-side)
-                dbc.Card([
-                    dbc.CardBody([
-                        html.Div([
-                            dbc.Button(
-                                "Report an Issue",
-                                href="https://forms.gle/1xP29PwFze5MHCTZ7",
-                                color="danger",
-                                target="_blank",
-                                className="me-2",
-                                style={"fontWeight": "bold", "fontSize": "14px", "padding": "6px 12px"}
-                            ),
-                            dbc.Button(
-                                "Contact AeroEdge",
-                                href="https://forms.gle/AqS1uuTgcY6sRHob9",
-                                color="secondary",
-                                target="_blank",
-                                style={"fontWeight": "bold", "fontSize": "14px", "padding": "6px 12px"}
+                            html.Div([
+                                html.Label("Maneuver", className="input-label-sm"),
+                                html.Span("?", id="help-maneuver", className="help-icon", n_clicks=0)
+                            ], style={"display": "flex", "alignItems": "center", "marginBottom": "4px"}),
+                            dcc.Dropdown(
+                                id="maneuver-select", className="dropdown",
+                                options=[
+                                    {"label": "Steep Turn", "value": "steep_turn"},
+                                    {"label": "Chandelle", "value": "chandelle"}
+                                ],
+                                placeholder="Select a Maneuver",
+                                style={"width": "100%"}
                             )
-                        ], style={
-                            "display": "flex",
-                            "alignItems": "center",
-                            "gap": "10px",
-                            "margin": "0",
-                            "padding": "0"
-                        })
-                    ], style={"padding": "10px"})
-                ], style={"marginTop": "5px", "marginBottom": "5px"}),
-            ], xs=12, md=4, className="resizable-sidebar"),
-            
+                        ], className="mb-2"),
+                        html.Div(id="maneuver-options-container"),
+                        # Hidden help-ghost element for callback
+                        html.Span("?", id="help-ghost", className="help-icon", n_clicks=0, style={"display": "none"})
+                    ], title="Maneuver Overlays", item_id="maneuvers"),
+                ], id="sidebar-accordion", active_item=["config"], always_open=True, className="sidebar-accordion"),
+            ], id="sidebar-container", xs=12, md=4, className="resizable-sidebar"),
 
             # Graph Column
             dbc.Col([
-                html.Div([  # This div enforces the aspect ratio
-                    dcc.Graph(
-                        id="em-graph",
-                        config={
-                            "staticPlot": False,
-                            "displaylogo": False,
-                            "displayModeBar": True,
-                            "modeBarButtonsToRemove": [
-                                "zoom2d", "pan2d", "select2d", "lasso2d",
-                                "zoomIn2d", "zoomOut2d", "autoScale2d", "resetScale2d",
-                                "hoverCompareCartesian", "toggleSpikelines",
-                                "drawline", "drawopenpath", "drawclosedpath", "drawcircle",
-                                "drawrect", "eraseshape"
-                            ]
-                        },
-                        className="dash-graph"
-                    )
-                ], className="graph-panel"),
-                html.Div("© 2025 Nicholas Len, AEROEDGE. All rights reserved.",
-                 className="footer")
-            ], className="graph-column")
-        ],className="main-row")
-    ], className="full-height-container")
+                html.Div([
+                    # Export toolbar (overlays on graph)
+                    html.Div([
+                        html.Button("PNG", id="png-button", className="btn-export"),
+                        html.Button("PDF", id="pdf-button", className="btn-export"),
+                        dcc.Download(id="png-download"),
+                        dcc.Download(id="pdf-download"),
+                    ], className="export-toolbar"),
 
-dcc.Checklist(id="oei-toggle", style={"display": "none"}, options=[], value=[])
+                    html.Div([
+                        dcc.Graph(
+                            id="em-graph",
+                            config={
+                                "staticPlot": False,
+                                "displaylogo": False,
+                                "displayModeBar": False,
+                                "responsive": True,
+                                "scrollZoom": False,
+                            },
+                            figure={"layout": {"paper_bgcolor": "#f7f9fc", "plot_bgcolor": "#f7f9fc", "autosize": True, "hovermode": "closest"}},
+                            className="dash-graph"
+                        )
+                    ], className="graph-panel"),
+
+                    # Legal Section (below graph)
+                    html.Div([
+                        html.Span("Full Legal Disclaimer", id="open-disclaimer", className="legal-link"),
+                        html.Span("|", className="separator"),
+                        html.Span("Terms of Use & Privacy Policy", id="open-terms-policy", className="legal-link"),
+                        html.Span("|", className="separator"),
+                        html.Span("\u00a9 2026 Nicholas Len, AEROEDGE. All rights reserved.", style={"color": "#888", "fontSize": "12px"}),
+                    ], className="legal-links"),
+                ], className="graph-wrapper"),
+            ], className="graph-column"),
+        ], className="main-row"),
+    ], className="full-height-container")
 
 def mobile_layout():
     return html.Div([
-        # Header Row (logo banner)
+        # Single Column Layout
         html.Div([
+            # Header banner with centered logo (same style as desktop)
             html.Div([
-                html.A(
-                    html.Img(src="/assets/logo.png", className="banner-logo"),
-                    href="https://flyaeroedge.com",
-                    style={"textDecoration": "none"}
-                )
-            ], className="banner-inner")
-        ], className="banner-header"),
+                html.Div([
+                    html.A(
+                        html.Img(src="/assets/logo.png", className="banner-logo", style={"height": "40px"}),
+                        href="https://flyaeroedge.com",
+                    )
+                ], className="banner-inner")
+            ], className="banner-header"),
 
-        # Main App Layout
-        html.Div([
-            # Sidebar
-            dbc.Col([
-                html.Div(id="resize-handle", className="resize-handle"),
-                html.Div("EM Diagram Generator", style={
-                    "fontWeight": "600", "fontSize": "20px",
-                    "marginBottom": "10px", "color": "#1b1e23"
-                }),
+            # Quick links row
+            html.Div([
+                html.Span("Quick Start", id="open-readme", className="quick-link link-blue", style={"cursor": "pointer"}),
+                html.Span("|", className="separator"),
+                html.A("Report Issue", href="https://forms.gle/1xP29PwFze5MHCTZ7", target="_blank", className="quick-link link-danger"),
+                html.Span("|", className="separator"),
+                html.A("Contact", href="https://forms.gle/AqS1uuTgcY6sRHob9", target="_blank", className="quick-link link-blue"),
+                html.Span("|", className="separator"),
+                html.A("Maneuver Overlay", href="https://overlay.flyaeroedge.com", target="_blank", className="quick-link link-orange"),
+            ], className="quick-links-bar-slim"),
 
-                dbc.Button("Edit / Create Aircraft", id="edit-aircraft-button", color="success", className="mb-3", style={"width": "200px", "fontWeight": "bold"}),
-                dbc.Col(dcc.Upload(id="upload-aircraft", children=dbc.Button("\ud83d\udcc2 Load Aircraft File", color="info", style={"fontWeight": "bold"}), multiple=False, accept=".json")),
-                                                       
+            # Configuration toggle bar
+            html.Div([
+                html.Span("Configuration"),
+                html.Button("▼", id="mobile-settings-toggle", className="mobile-config-btn"),
+            ], className="mobile-config-bar"),
 
-                # Aircraft Configuration Panel
-                dbc.Card([
-                    dbc.CardHeader("Aircraft Configuration"),
-                    dbc.CardBody([
+            # Collapsible Settings Content
+            dbc.Collapse([
+                html.Div([
+                    # Action buttons
+                    html.Div([
+                        dbc.Button("Edit/Create Aircraft", id="edit-aircraft-button", className="btn-sm btn-primary-orange", size="sm"),
+                        dcc.Upload(id="upload-aircraft", children=dbc.Button("Load Aircraft File", className="btn-sm btn-primary-orange", size="sm"), multiple=False, accept=".json"),
+                    ], className="mobile-action-btns"),
+
+                    # Aircraft Selection
+                    html.Div([
+                        html.Label("Aircraft", className="input-label-sm"),
+                        dcc.Dropdown(id="aircraft-select", options=[], placeholder="Select Aircraft...", className="dropdown")
+                    ], className="mb-2"),
+
+                    # Compact config section
+                    html.Div([
+                        html.Div([
+                            html.Label("Engine", className="input-label-sm"),
+                            dcc.Dropdown(id="engine-select", className="dropdown"),
+                        ], className="mb-2"),
+                        html.Div([
+                            html.Label("Category", className="input-label-sm"),
+                            dcc.Dropdown(id="category-select", className="dropdown")
+                        ], className="mb-2"),
+                        html.Div([
+                            html.Label("Flaps", className="input-label-sm"),
+                            dcc.Dropdown(id="config-select", className="dropdown")
+                        ], className="mb-2"),
+                        html.Div([
+                            html.Label("Gear", className="input-label-sm"),
+                            dcc.Dropdown(id="gear-select", className="dropdown")
+                        ], id="gear-select-container", className="mb-2", style={"display": "none"}),
+                        html.Div([
+                            html.Label("Weight", className="input-label-sm"),
+                            html.Div(id="total-weight-display", className="weight-box-sm")
+                        ], className="mb-2"),
                         dbc.Row([
                             dbc.Col([
-                                html.Label("Aircraft", className="input-label"),
-                                dcc.Dropdown(id="aircraft-select", options=[], placeholder="Select an Aircraft...", className="dropdown")
-                            ])
-                        ], className="mb-3"),
-
-                        dbc.Row([
-                            dbc.Col([
-                                html.Label("Engine", className="input-label"),
-                                dcc.Dropdown(id="engine-select", className="dropdown"),
-                                
-                            ])
-                        ], className="mb-3"),
-
-                        dbc.Row([
-                            dbc.Col([
-                                html.Label("Category", className="input-label"),
-                                dcc.Dropdown(id="category-select", className="dropdown")
-                            ])
-                        ], className="mb-3"),
-
-                        dbc.Row([
-                            dbc.Col([
-                                html.Label("Flap Configuration", className="input-label"),
-                                dcc.Dropdown(id="config-select", className="dropdown")
-                            ])
-                        ], className="mb-3"),
-
-                        dbc.Row([
-                            dbc.Col([
-                                html.Label("Landing Gear", className="input-label"),
-                                dcc.Dropdown(id="gear-select", className="dropdown")
-                            ])
-                        ], className="mb-3"),
-
-                        dbc.Row([
-                            dbc.Col([
-                                html.Label("Total Weight", className="input-label"),
-                                html.Div(id="total-weight-display", className="weight-box")
-                            ])
-                        ], className="mb-3"),
-
-                        dbc.Row([
-                            dbc.Col([
-                                html.Label("Occupants", className="input-label"),
+                                html.Label("Pax", className="input-label-sm"),
                                 dcc.Dropdown(id="occupants-select", className="dropdown-small")
                             ], width=6),
                             dbc.Col([
-                                html.Label("Occupant Weight (lbs)", className="input-label"),
+                                html.Label("Pax Wt", className="input-label-sm"),
                                 dcc.Input(id="passenger-weight-input", type="number", value=180, min=50, max=400, step=1, className="input-small")
                             ], width=6)
-                        ], className="mb-3"),
-
-                        
-                        dbc.Row([
-                            dbc.Col([
-                                html.Label("Fuel (gal)", className="input-label"),
-                                dcc.Slider(id="fuel-slider", min=0, max=50, step=1, value=20, marks={}, tooltip={"always_visible": True})
-                            ])
-                        ], className="mb-3"),
-
-                        dbc.Row([
-                            dbc.Col([
-                                html.Label("Power Setting", className="input-label"),
-                                dcc.Slider(
-                                    id="power-setting",
-                                    min=0.05,
-                                    max=1.0,
-                                    step=0.05,
-                                    value=0.50,
-                                    marks={0.05: "IDLE", 0.2: "20%", 0.4: "40%", 0.6: "60%", 0.8: "80%", 1: "100%"},
-                                    tooltip={"always_visible": True}
-                                )
-                            ])
-                        ], className="mb-3"),
-
+                        ], className="mb-2"),
+                        html.Div([
+                            html.Label("Fuel (gal)", className="input-label-sm"),
+                            dcc.Slider(id="fuel-slider", min=0, max=50, step=1, value=20, marks={}, tooltip={"always_visible": True})
+                        ], className="mb-2"),
+                        html.Div([
+                            html.Label("Power", className="input-label-sm"),
+                            dcc.Slider(id="power-setting", min=0.05, max=1.0, step=0.05, value=0.50,
+                                marks={0.05: "IDLE", 0.5: "50%", 1: "100%"}, tooltip={"always_visible": True})
+                        ], className="mb-2"),
                         html.Div([
                             dcc.Slider(id="cg-slider", min=0, max=1, value=0.5, step=0.01)
-                        ], id="cg-slider-container"),
-
-                        dbc.Row([
-                            dbc.Col([
-                                html.Label("Altitude (ft)", className="input-label"),
-                                dcc.Slider(id="altitude-slider", min=0, max=35000, step=1000, value=0, marks={}, tooltip={"always_visible": True})
-                            ])
-                        ], className="mb-3"),
-
-                        dbc.Row([
-                            dbc.Col([
-                                html.Label("Flight Path Angle (deg)", className="input-label"),
-                                dcc.Slider(
-                                    id="pitch-angle",
-                                    min=-15,
-                                    max=25,
-                                    step=1,
-                                    value=0,
-                                    marks={-15: "-15°", -10: "-10°", -5: "-5°", 0: "0°", 5: "5°", 10: "10°", 15: "15°", 20: "20°", 25: "25°"},
-                                    tooltip={"always_visible": True}
-                                )
-                            ])
-                        ], className="mb-3")
-                    ])
-                ], className="mb-4"),
-
-                # Overlay & Units
-                dbc.Card([
-                    dbc.CardHeader("Overlay Options"),
-                    dbc.CardBody([
-
-                        # Airspeed Units Toggle
+                        ], id="cg-slider-container", className="mb-2"),
                         html.Div([
-                            html.Label("Airspeed Units", className="input-label", style={"marginBottom": "6px"}),
-                            dbc.RadioItems(
-                                id="unit-select",
-                                options=[
-                                    {"label": "KIAS", "value": "KIAS"},
-                                    {"label": "MPH", "value": "MPH"}
-                                ],
-                                value="KIAS",
-                                inline=True,
-                                
-                            )
-                        ], className="radio-inline-group"),
+                            html.Label("FPA (deg)", className="input-label-sm"),
+                            dcc.Slider(id="pitch-angle", min=-15, max=25, step=1, value=0,
+                                marks={-15: "-15", 0: "0", 25: "25"}, tooltip={"always_visible": True})
+                        ], className="mb-2"),
+                    ], id="config-details"),
 
-                        # Overlay checklist (always visible)
-                        dcc.Checklist(
-                            id="overlay-toggle",
-                            options=[
-                                {"label": "Ps Contours", "value": "ps"},
-                                {"label": "Intermediate G Lines", "value": "g"},
-                                {"label": "Turn Radius Lines", "value": "radius"},
-                                {"label": "Angle of Bank Shading", "value": "aob"},
-                                {"label": "Negative G Envelope", "value": "negative_g"}
-                            ],
-                            value=["g", "radius", "aob"],
-                            labelStyle={"display": "block"},
-                            className="checklist mb-3"
-                        ),
-                        html.Div([
-                            html.Label("Engine Failure Simulation", className="input-label"),
-                            dcc.Checklist(
-                                id="oei-toggle",
-                                options=[{"label": "Simulate One Engine Inoperative", "value": "enabled"}],
-                                value=[],
-                                style={"marginBottom": "5px"},
-                            )
-                        ], id="oei-container", className="mb-3"),
-                        # OEI toggle (Simulate One Engine Inoperative)
-                        html.Div(id="oei-container", className="mb-3"),
+                    # Environment (compact)
+                    html.Div([
+                        html.Label("Airport", className="input-label-sm"),
+                        dcc.Dropdown(id="airport-select", options=AIRPORT_OPTIONS, placeholder="Search...", searchable=True, clearable=True)
+                    ], className="mb-2"),
+                    html.Div([
+                        html.Label("Altitude (ft)", className="input-label-sm"),
+                        dcc.Slider(id="altitude-slider", min=0, max=35000, step=500, value=0, marks={}, tooltip={"always_visible": True})
+                    ], className="mb-2"),
+                    dbc.Row([
+                        dbc.Col([
+                            html.Label("OAT °C", className="input-label-sm"),
+                            dcc.Input(id="oat-input", type="number", value=15, min=-50, max=50, step=1, className="input-small", style={"width": "100%"})
+                        ], width=4),
+                        dbc.Col([
+                            html.Label("°F", className="input-label-sm"),
+                            dcc.Input(id="oat-fahrenheit-display", type="text", value="59", disabled=True, className="input-small", style={"width": "100%", "backgroundColor": "#eee"})
+                        ], width=4),
+                        dbc.Col([
+                            html.Label("Altim", className="input-label-sm"),
+                            dcc.Input(id="altimeter-input", type="number", value=29.92, min=28.0, max=31.0, step=0.01, className="input-small", style={"width": "100%"})
+                        ], width=4)
+                    ], className="mb-2"),
+                    html.Div(id="pa-da-display", className="pa-da-box-sm", children=[
+                        html.Span("PA: 0 ft | DA: 0 ft", style={"fontSize": "10px", "color": "#666"})
+                    ]),
 
-                        # Dynamic Vmc / Vyse Checklist (conditionally shown)
-                        html.Div([
-                            dcc.Checklist(
-                                id="multi-engine-toggle-options",
-                                options=[
-                                    {"label": "Dynamic Vmc", "value": "vmca"},
-                                    {"label": "Dynamic Vyse", "value": "dynamic_vyse"}
-                                ],
-                                value=[],
-                                labelStyle={"display": "block"}
-                            )
-                        ], id="multi-engine-toggles", style={"display": "none"}, className="mb-3"),
+                    # Overlays (compact)
+                    html.Div([
+                        html.Label("Units", className="input-label-sm", style={"marginRight": "8px"}),
+                        dbc.RadioItems(id="unit-select", options=[{"label": "KIAS", "value": "KIAS"}, {"label": "MPH", "value": "MPH"}],
+                            value="KIAS", inline=True, className="radio-sm")
+                    ], className="mb-2 d-flex align-items-center"),
+                    dcc.Checklist(id="mobile-overlay-checklist",
+                        options=[
+                            {"label": "Ps", "value": "ps"},
+                            {"label": "G Lines", "value": "g"},
+                            {"label": "Radius", "value": "radius"},
+                            {"label": "AoB", "value": "aob"},
+                            {"label": "Neg G", "value": "negative_g"}
+                        ],
+                        value=["g", "radius", "aob"],
+                        inline=True, className="checklist-compact mb-2"
+                    ),
+                    dcc.Store(id="overlay-toggle", data=["g", "radius", "aob"]),
+                    html.Div([
+                        dcc.Checklist(id="oei-toggle", options=[{"label": "OEI Sim", "value": "enabled"}], value=[], inline=True)
+                    ], id="oei-container", className="mb-2"),
+                    html.Div([
+                        dcc.Checklist(id="multi-engine-toggle-options",
+                            options=[{"label": "Dyn Vmc", "value": "vmca"}, {"label": "Dyn Vyse", "value": "dynamic_vyse"}],
+                            value=[], inline=True)
+                    ], id="multi-engine-toggles", style={"display": "none"}),
+                    html.Div([
+                        dcc.RadioItems(id="prop-condition",
+                            options=[{"label": "Feath", "value": "feathered"}, {"label": "Stat", "value": "stationary"}, {"label": "Wmill", "value": "windmilling"}],
+                            value="feathered", inline=True, className="radio-sm")
+                    ], id="prop-condition-container", style={"display": "none"}),
 
-                        
-                        # === Prop Condition (only for Dynamic Vmc) ===
-                        html.Div([
-                            html.Label("Propeller Condition", className="input-label"),
-                            dcc.RadioItems(
-                                id="prop-condition",
-                                options=[
-                                    {"label": "Feathered", "value": "feathered"},
-                                    {"label": "Stationary", "value": "stationary"},
-                                    {"label": "Windmilling", "value": "windmilling"}                                    
-                                ],
-                                value="feathered",
-                                labelStyle={"display": "inline-block", "margin-right": "10px"}
-                            )
-                        ], id="prop-condition-container", style={"display": "none"})
-                    ])
-                ], className="mb-4"),
+                    # Maneuver
+                    html.Div([
+                        html.Label("Maneuver", className="input-label-sm"),
+                        dcc.Dropdown(id="maneuver-select", options=[{"label": "Steep Turn", "value": "steep_turn"}, {"label": "Chandelle", "value": "chandelle"}], placeholder="Select...")
+                    ], className="mb-2"),
+                    html.Div(id="maneuver-options-container"),
+                ], className="mobile-settings-content")
+            ], id="mobile-settings-collapse", is_open=False),
 
-                # Maneuver Builder
-                dbc.Card([
-                    dbc.CardHeader("Maneuver Overlays"),
-                    dbc.CardBody([
-                        dbc.Row([
-                            dbc.Col([
-                                html.Label("Maneuver", className="input-label"),
-                                dcc.Dropdown(
-                                    id="maneuver-select", className="dropdown",
-                                    options=[
-                                        {"label": "Steep Turn", "value": "steep_turn"},
-                                        {"label": "Chandelle", "value": "chandelle"}
-                                    ],
-                                    placeholder="Select a Maneuver",
-                                    style={"width": "100%"}
-                                )
-                            ])
-                        ], className="mb-3"),
-
-                        dbc.Row([
-                            dbc.Col(html.Div(id="maneuver-options-container"))
-                        ])
-                    ])
-                ], className="mb-4"),
-
-                # Export
-                dbc.Card([
-                    dbc.CardHeader("Export as PNG (use \ud83d\udcf7 icon on graph)"),
-                    dbc.CardBody([
-                        dbc.Button("Export as PDF", id="pdf-button", color="primary", className="me-2"),
-                        dcc.Download(id="pdf-download")
-                    ])
-                ]),
-
-                # Error Reporting and Contact
-                dbc.Card([
-                    dbc.CardBody([
-                        dbc.Button("Report An Issue", href="https://forms.gle/1xP29PwFze5MHCTZ7", color="danger", target="_blank", className="me-2"),
-                        dbc.Button("Contact AeroEdge", href="https://forms.gle/AqS1uuTgcY6sRHob9", color="secondary", target="_blank")
-                    ], style={"display": "flex", "gap": "10px", "flexWrap": "wrap"})
-                ], style={"marginTop": "5px", "marginBottom": "5px"}),
-            ], xs=12, md=4, className="resizable-sidebar"),
-
-            # Graph Column
-            dbc.Col([
-                html.Div([
-                    dcc.Graph(
-                        id="em-graph",
-                        config={
-                            "staticPlot": True,
-                            "displaylogo": False,
-                            "displayModeBar": True,
-                            "modeBarButtonsToRemove": [
-                                "zoom2d", "pan2d", "select2d", "lasso2d", "zoomIn2d", "zoomOut2d",
-                                "autoScale2d", "resetScale2d", "hoverClosestCartesian", "hoverCompareCartesian",
-                                "toggleSpikelines", "drawline", "drawopenpath", "drawclosedpath",
-                                "drawcircle", "drawrect", "eraseshape"
-                            ],
-                            "modeBarButtonsToAdd": ["toImage"],
-                            "modeBarMode": "always"
-                        },
-                        className="dash-graph"
-                    )
-                ], className="graph-panel"),
-            ], className="graph-wrapper"),
-
-            # Legal Section (bottom)
+            # Graph (always visible)
             html.Div([
-                html.Div("\u00a9 2025 Nicholas Len, AEROEDGE. All rights reserved. For reference and educational purposes only.", className="footer"),
-
-                # Legal Links Row
                 html.Div([
-                    html.A("Full Legal Disclaimer", href="#", id="open-disclaimer", style={"fontSize": "13px", "textDecoration": "underline", "color": "#007bff", "cursor": "pointer"}),
-                    html.Span(" | ", style={"margin": "0 6px", "color": "#999"}),
-                    html.A("Terms of Use & Privacy Policy", href="#", id="open-terms-policy", style={"fontSize": "13px", "textDecoration": "underline", "color": "#007bff", "cursor": "pointer"})
-                ], style={"textAlign": "center", "marginTop": "8px", "marginBottom": "12px"}),
+                    html.Button("PNG", id="png-button", className="btn-export-sm"),
+                    html.Button("PDF", id="pdf-button", className="btn-export-sm"),
+                    dcc.Download(id="png-download"),
+                    dcc.Download(id="pdf-download"),
+                ], className="export-toolbar-mobile"),
+                dcc.Graph(
+                    id="em-graph",
+                    config={
+                        "staticPlot": False,
+                        "displaylogo": False,
+                        "displayModeBar": False,
+                        "responsive": True,
+                        "scrollZoom": False,
+                        "doubleClick": False,
+                    },
+                    figure={"layout": {
+                        "paper_bgcolor": "#f7f9fc",
+                        "plot_bgcolor": "#f7f9fc",
+                        "autosize": True,
+                        "hovermode": "closest",
+                        "dragmode": False,
+                        "xaxis": {"fixedrange": True},
+                        "yaxis": {"fixedrange": True},
+                    }},
+                    className="dash-graph",
+                    style={"height": "60vh", "width": "100%"}
+                )
+            ], className="mobile-graph-container"),
 
-                # FAA Disclaimer Banner
-                html.Div(
-                    "\u26a0\ufe0f This tool visualizes performance data based on public or user-submitted values and is for educational use only. It is not FAA-approved and may not reflect actual aircraft capabilities. Always verify against the aircraft's POH/AFM. \u26a0\ufe0f",
-                    style={
-                        "backgroundColor": "#fff3cd", "border": "1px solid #ffeeba",
-                        "padding": "8px 14px", "fontSize": "12px", "color": "#856404",
-                        "textAlign": "center", "fontWeight": "500", "margin": "0 12px 10px 12px"
-                    }
-                ),
-            ]),
-        ], className="main-row"),
+            # Legal footer
+            html.Div([
+                html.Span("Disclaimer", id="open-disclaimer", className="legal-link-sm"),
+                html.Span(" | ", style={"color": "#999"}),
+                html.Span("Terms", id="open-terms-policy", className="legal-link-sm"),
+                html.Span(" | © 2025 AeroEdge", style={"color": "#999", "fontSize": "9px"})
+            ], className="mobile-legal"),
 
-        # Modals (disclaimer + terms)
-        dbc.Modal([
-            dbc.ModalHeader("AeroEdge Disclaimer", close_button=False),
-            dbc.ModalBody([
-                html.P("This tool supplements\u2014not replaces\u2014FAA-published documentation.", style={"marginBottom": "8px"}),
-                html.P("It is intended for educational and reference use only, and has not been approved or endorsed by the Federal Aviation Administration (FAA).", style={"marginBottom": "8px"}),
-                html.P("While AeroEdge is aligned with FAA safety principles, it is not an official source of operational data. Users must consult certified instructors and approved aircraft documentation when making flight decisions.", style={"marginBottom": "8px"}),
-                html.P("The data presented may be incomplete, inaccurate, outdated, or derived from public or user-submitted sources. No warranties, express or implied, are made regarding its accuracy, completeness, or fitness for purpose.", style={"marginBottom": "8px"}),
-                html.P("Instructors and users are encouraged to verify all EM diagram outputs against certified POH/AFM values. This tool is not a substitute for competent flight instruction, or for compliance with applicable regulations, including Airworthiness Directives (ADs), Federal Aviation Regulations (FARs), or Advisory Circulars (ACs).", style={"marginBottom": "8px"}),
-                html.P("If any information conflicts with the aircraft\u2019s FAA-approved AFM or POH, the official documentation shall govern.", style={"marginBottom": "8px"}),
-                html.P("AeroEdge disclaims all liability for errors, omissions, injuries, or damages resulting from the use of this application or website. Use of this tool constitutes acceptance of these terms.", style={"marginBottom": "8px"})
-            ]),
-            dbc.ModalFooter(
-                dbc.Button("Close", id="close-disclaimer", className="ms-auto", color="secondary")
-            )
-        ], id="disclaimer-modal", is_open=False),
-
-        dbc.Modal([
-            dbc.ModalHeader("Terms of Use & Privacy Policy", close_button=False),
-            dbc.ModalBody([
-                html.H6("Terms of Use", className="mb-2 mt-2"),
-                html.P("By accessing or using the AeroEdge application and its associated services, you agree to use this tool solely for educational and informational purposes. This tool is not FAA-certified and should not be relied upon for flight planning, aircraft operation, or regulatory compliance.", style={"marginBottom": "8px"}),
-                html.P("Users must verify all performance data with the aircraft's official Pilot's Operating Handbook (POH) or Aircraft Flight Manual (AFM). Use of AeroEdge is at your own risk. AeroEdge disclaims liability for any direct, indirect, incidental, or consequential damages arising from its use.", style={"marginBottom": "8px"}),
-                html.H6("Privacy Policy", className="mb-2 mt-4"),
-                html.P("AeroEdge does not collect, store, or share any personally identifiable information (PII). All use of the application is anonymous. Uploaded aircraft files remain local to your device and are not transmitted or stored on any external servers.", style={"marginBottom": "8px"}),
-                html.P("If you submit feedback through linked forms, that information is governed by the terms of Google Forms. AeroEdge does not sell or distribute any user-submitted information and uses it only to improve functionality and user experience.", style={"marginBottom": "8px"}),
-                html.P("By using this application, you acknowledge and accept these terms.")
-            ]),
-            dbc.ModalFooter(
-                dbc.Button("Close", id="close-terms-policy", className="ms-auto", color="secondary")
-            )
-        ], id="terms-policy-modal", is_open=False),
-
-        # Store fallback for checklist
-        dcc.Checklist(id="oei-toggle", style={"display": "none"}, options=[], value=[])
-    ], className="full-height-container")
+            # Hidden placeholders for desktop-only components (prevents callback errors)
+            html.Div([
+                # Desktop toggle switches - use hidden switches
+                dbc.Switch(id="toggle-ps", value=False, style={"display": "none"}),
+                dbc.Switch(id="toggle-g", value=True, style={"display": "none"}),
+                dbc.Switch(id="toggle-radius", value=True, style={"display": "none"}),
+                dbc.Switch(id="toggle-aob", value=True, style={"display": "none"}),
+                dbc.Switch(id="toggle-negative-g", value=False, style={"display": "none"}),
+                dbc.Switch(id="toggle-vmca", value=False, style={"display": "none"}),
+                dbc.Switch(id="toggle-vyse", value=False, style={"display": "none"}),
+                # Desktop unit buttons
+                html.Button("KIAS", id="btn-kias", style={"display": "none"}),
+                html.Button("MPH", id="btn-mph", style={"display": "none"}),
+                # Desktop prop condition buttons
+                html.Button("Feathered", id="btn-feathered", style={"display": "none"}),
+                html.Button("Stationary", id="btn-stationary", style={"display": "none"}),
+                html.Button("Windmilling", id="btn-windmilling", style={"display": "none"}),
+                # Desktop help icons
+                html.Span(id="help-fpa", style={"display": "none"}),
+                html.Span(id="help-ps", style={"display": "none"}),
+                html.Span(id="help-g", style={"display": "none"}),
+                html.Span(id="help-radius", style={"display": "none"}),
+                html.Span(id="help-aob", style={"display": "none"}),
+                html.Span(id="help-negative-g", style={"display": "none"}),
+                html.Span(id="help-dvmc", style={"display": "none"}),
+                html.Span(id="help-dvyse", style={"display": "none"}),
+                html.Span(id="help-maneuver", style={"display": "none"}),
+                html.Span(id="help-ghost", style={"display": "none"}),
+                # Desktop sidebar elements
+                html.Button("«", id="sidebar-collapse-btn", style={"display": "none"}),
+                html.Div(id="sidebar-container", className="resizable-sidebar", style={"display": "none"}),
+                dbc.Accordion(id="sidebar-accordion", style={"display": "none"}),
+            ], style={"display": "none"}),
+        ], className="mobile-main"),
+    ], className="mobile-container")
 
 
 # ✅ Automatically open the browser when the app starts
@@ -969,16 +871,67 @@ def update_category_dropdown(ac_name):
     options = [{"label": cat.capitalize(), "value": cat} for cat in categories]
     default = options[0]["value"] if options else None
     return options, default
+
+
+@app.callback(
+    Output("config-details", "style"),
+    Output("sidebar-accordion", "active_item"),
+    Input("aircraft-select", "value"),
+)
+def expand_ui_on_aircraft_select(ac_name):
+    """Show config details and expand all accordions when aircraft is selected."""
+    if not ac_name:
+        return {"display": "none"}, ["config"]
+    return {"display": "block"}, ["config", "environment", "overlays", "maneuvers"]
+
 from dash import html
 from dash.exceptions import PreventUpdate
 from dash.dependencies import Input, Output
+
+# Segmented control for airspeed units
+@app.callback(
+    Output("unit-select", "data"),
+    Output("btn-kias", "className"),
+    Output("btn-mph", "className"),
+    Input("btn-kias", "n_clicks"),
+    Input("btn-mph", "n_clicks"),
+    prevent_initial_call=True
+)
+def toggle_airspeed_units(kias_clicks, mph_clicks):
+    triggered = ctx.triggered_id
+    if triggered == "btn-kias":
+        return "KIAS", "segment-btn active", "segment-btn"
+    elif triggered == "btn-mph":
+        return "MPH", "segment-btn", "segment-btn active"
+    return "KIAS", "segment-btn active", "segment-btn"
+
+# Segmented control for propeller condition
+@app.callback(
+    Output("prop-condition", "data"),
+    Output("btn-feathered", "className"),
+    Output("btn-stationary", "className"),
+    Output("btn-windmilling", "className"),
+    Input("btn-feathered", "n_clicks"),
+    Input("btn-stationary", "n_clicks"),
+    Input("btn-windmilling", "n_clicks"),
+    prevent_initial_call=True
+)
+def toggle_prop_condition(feathered_clicks, stationary_clicks, windmilling_clicks):
+    triggered = ctx.triggered_id
+    if triggered == "btn-feathered":
+        return "feathered", "segment-btn active", "segment-btn", "segment-btn"
+    elif triggered == "btn-stationary":
+        return "stationary", "segment-btn", "segment-btn active", "segment-btn"
+    elif triggered == "btn-windmilling":
+        return "windmilling", "segment-btn", "segment-btn", "segment-btn active"
+    return "feathered", "segment-btn active", "segment-btn", "segment-btn"
 
 @app.callback(
     Output("multi-engine-toggles", "style"),
     Output("prop-condition-container", "style"),
     Input("aircraft-select", "value"),
     Input("oei-toggle", "value"),
-    Input("multi-engine-toggle-options", "value"),
+    Input("multi-engine-toggle-options", "data"),
     prevent_initial_call=True
 )
 def update_dynamic_vmca_visibility(ac_name, oei_toggle, multi_engine_opts):
@@ -1028,18 +981,29 @@ def update_aircraft_dependent_inputs(ac_name):
     occ_opts = [{"label": str(i), "value": i} for i in range(seat_count + 1)]
     occ_val = min(2, seat_count)
 
-    # Fuel
+    # Fuel - create intuitive even marks
     fuel_max = ac["fuel_capacity_gal"]
-    # Determine 8 evenly spaced marks between min and max
-    tick_count = 10  # Total including min and max
-    step = fuel_max / (tick_count - 1)
 
-    fuel_marks = {
-        int(round(i * step)): str(int(round(i * step)))
-        for i in range(tick_count)
-    }
-    fuel_marks[0] = "0"
-    fuel_marks[fuel_max] = f"{fuel_max}"
+    # Determine a nice step size based on fuel capacity
+    if fuel_max <= 20:
+        step = 5
+    elif fuel_max <= 50:
+        step = 10
+    elif fuel_max <= 100:
+        step = 20
+    elif fuel_max <= 200:
+        step = 25
+    else:
+        step = 50
+
+    # Generate marks at even intervals
+    fuel_marks = {}
+    mark_val = 0
+    while mark_val < fuel_max:
+        fuel_marks[mark_val] = str(mark_val)
+        mark_val += step
+    # Always include the max value
+    fuel_marks[fuel_max] = str(fuel_max)
 
     # Altitude
     ceiling = ac.get("mx_altitude") or ac.get("max_altitude")
@@ -1058,8 +1022,117 @@ def update_aircraft_dependent_inputs(ac_name):
         fuel_marks,
         ceiling,
         alt_marks,
-        
+
     )
+
+
+# =============================================================================
+# AIRPORT & ENVIRONMENT CALLBACKS
+# =============================================================================
+
+@app.callback(
+    Output("altitude-slider", "min"),
+    Output("altitude-slider", "value"),
+    Output("altitude-slider", "marks", allow_duplicate=True),
+    Input("airport-select", "value"),
+    State("altitude-slider", "value"),
+    State("altitude-slider", "max"),
+    prevent_initial_call=True
+)
+def update_altitude_from_airport(airport_id, current_alt, max_alt):
+    """Update altitude slider min and value based on selected airport."""
+    if not airport_id:
+        # No airport selected - reset to sea level minimum
+        marks = {i: str(i) for i in range(0, int(max_alt) + 1, 5000)}
+        marks[0] = "Sea Level"
+        return 0, 0, marks
+
+    # Find airport elevation
+    airport = get_airport_by_id(AIRPORT_DATA, airport_id)
+    if not airport:
+        return 0, current_alt, dash.no_update
+
+    field_elev = airport.get("elevation_ft", 0)
+
+    # Round to nearest 100 for cleaner slider
+    field_elev_rounded = int(round(field_elev / 100) * 100)
+
+    # Generate marks starting from field elevation
+    marks = {}
+    for i in range(0, int(max_alt) + 1, 5000):
+        if i >= field_elev_rounded:
+            marks[i] = str(i)
+    marks[field_elev_rounded] = f"{field_elev_rounded} (Field)"
+    if max_alt not in marks:
+        marks[int(max_alt)] = f"{int(max_alt)} ft"
+
+    # Set value to field elevation if current is below
+    new_value = max(field_elev_rounded, current_alt) if current_alt else field_elev_rounded
+
+    return field_elev_rounded, new_value, marks
+
+
+@app.callback(
+    Output("pa-da-display", "children"),
+    Input("altitude-slider", "value"),
+    Input("oat-input", "value"),
+    Input("altimeter-input", "value"),
+)
+def update_pa_da_display(field_elev, oat_c, altimeter):
+    """Calculate and display Pressure Altitude and Density Altitude."""
+    field_elev = field_elev or 0
+    oat_c = oat_c if oat_c is not None else 15
+    altimeter = altimeter if altimeter is not None else 29.92
+
+    # Calculate Pressure Altitude
+    pa = compute_pressure_altitude(field_elev, altimeter)
+
+    # Calculate Density Altitude
+    da = compute_density_altitude(pa, oat_c)
+
+    # Calculate ISA temperature at this altitude for reference
+    isa_temp = TEMP_SL_C - (pa * LAPSE_RATE_K_FT)
+
+    # Color code DA based on how much above PA it is
+    da_diff = da - pa
+    if da_diff > 3000:
+        da_color = "#dc3545"  # Red - hot day, significant DA increase
+    elif da_diff > 1000:
+        da_color = "#fd7e14"  # Orange - warm
+    elif da_diff < -1000:
+        da_color = "#0d6efd"  # Blue - cold
+    else:
+        da_color = "#198754"  # Green - near standard
+
+    return html.Div([
+        html.Span(f"PA: {int(pa):,} ft", style={"marginRight": "15px", "fontSize": "12px"}),
+        html.Span(f"DA: {int(da):,} ft", style={"color": da_color, "fontWeight": "bold", "fontSize": "12px"}),
+        html.Span(f" (ISA: {isa_temp:.0f}°C)", style={"fontSize": "10px", "color": "#888", "marginLeft": "8px"})
+    ])
+
+
+@app.callback(
+    Output("oat-input", "value"),
+    Input("altitude-slider", "value"),
+    prevent_initial_call=True
+)
+def update_default_oat(field_elev):
+    """Set default OAT to ISA temperature at field elevation when altitude changes."""
+    field_elev = field_elev or 0
+    # ISA temperature at altitude
+    isa_temp = TEMP_SL_C - (field_elev * LAPSE_RATE_K_FT)
+    return round(isa_temp)
+
+
+@app.callback(
+    Output("oat-fahrenheit-display", "value"),
+    Input("oat-input", "value"),
+)
+def update_oat_fahrenheit(oat_c):
+    """Convert OAT from Celsius to Fahrenheit for display."""
+    oat_c = oat_c if oat_c is not None else 15
+    oat_f = (oat_c * 9/5) + 32
+    return f"{oat_f:.0f}"
 
 
 @app.callback(
@@ -1074,29 +1147,50 @@ def render_cg_slider(ac_name):
     raw_min, raw_max = ac["cg_range"]
     cg_min = round(float(raw_min), 2)
     cg_max = round(float(raw_max), 2)
-    cg_mid = round((cg_min + cg_max) / 2, 2)
+    cg_range = cg_max - cg_min
 
-    cg_marks = {
-        str(cg_min): f"FWD ({cg_min:.1f}\")",
-        str(cg_mid): f"MID ({cg_mid:.1f}\")",
-        str(cg_max): f"AFT ({cg_max:.1f}\")"
-    }
+    # Determine step size based on CG range
+    if cg_range <= 5:
+        step = 0.5
+    elif cg_range <= 10:
+        step = 1.0
+    else:
+        step = 2.0
+
+    # Generate marks at even intervals
+    import math
+    # Start from the first even step value >= cg_min
+    first_mark = math.ceil(cg_min / step) * step
+
+    cg_marks = {}
+    # Add FWD label at min
+    cg_marks[cg_min] = f"FWD"
+
+    # Add intermediate marks
+    mark_val = first_mark
+    while mark_val < cg_max:
+        if mark_val > cg_min:  # Don't duplicate the min
+            cg_marks[round(mark_val, 1)] = f"{mark_val:.1f}"
+        mark_val += step
+
+    # Add AFT label at max
+    cg_marks[cg_max] = f"AFT"
 
     dprint("CG DEBUG:", {
         "cg_min": cg_min,
-        "cg_mid": cg_mid,
         "cg_max": cg_max,
+        "step": step,
         "marks": cg_marks
-        })
+    })
 
     return html.Div([
-        html.Label("Center of Gravity (inches)"),
+        html.Label("Center of Gravity (inches)", className="input-label-sm"),
         dcc.Slider(
             id="cg-slider",
             min=cg_min,
             max=cg_max,
-            value=cg_mid,
-            step=None,
+            value=round((cg_min + cg_max) / 2, 2),
+            step=0.1,
             marks=cg_marks,
             tooltip={"always_visible": True}
         )
@@ -1133,7 +1227,7 @@ def update_gear_dropdown(ac_name):
         return [], None
 
 @app.callback(
-    Output("gear-select", "style"),
+    Output("gear-select-container", "style"),
     Input("aircraft-select", "value")
 )
 def toggle_gear_selector_visibility(ac_name):
@@ -1158,9 +1252,10 @@ def update_total_weight(ac_name, fuel, occupants, pax_weight):
 
     ac = aircraft_data[ac_name]
     empty = ac["empty_weight"]
+    fuel = fuel if fuel is not None else 0
     fuel_weight = fuel * ac["fuel_weight_per_gal"]
-    pax_weight = pax_weight or 180
-    occupants = occupants or 0
+    pax_weight = pax_weight if pax_weight is not None else 180
+    occupants = occupants if occupants is not None else 0
     people_weight = occupants * pax_weight
     total = empty + fuel_weight + people_weight
     max_weight = ac["max_weight"]
@@ -1183,13 +1278,37 @@ def calculate_vmca(
     cg,
     cg_range,
     prop_condition,
+    pressure_altitude=0,
+    oat_c=15,
     unit="KIAS",
     bank_angles_deg=np.linspace(-5, 10, 50)
 ):
     """
-    Returns Vmca values across a range of bank angles based on power, weight, CG, and prop condition.
-    """
+    Returns Vmca values across a range of bank angles based on power, weight, CG,
+    prop condition, and density altitude.
 
+    Physics basis:
+    - Vmc is the minimum speed at which directional control can be maintained with
+      critical engine inoperative and max power on the operating engine
+    - Published Vmc is typically at: max gross weight, most aft CG, sea level,
+      5° bank into dead engine, critical engine windmilling/feathered
+
+    Args:
+        published_vmca: Published Vmca speed (KIAS) - typically at max weight, aft CG
+        power_fraction: Power setting on operating engine (0-1)
+        total_weight: Current aircraft weight (lbs)
+        reference_weight: Weight at which Vmca was published (typically max gross)
+        cg: Current CG position
+        cg_range: [forward_limit, aft_limit] CG range
+        prop_condition: "feathered", "stationary", or "windmilling"
+        pressure_altitude: Pressure altitude in feet
+        oat_c: Outside air temperature in Celsius
+        unit: Output unit ("KIAS" or "MPH")
+        bank_angles_deg: Array of bank angles to compute Vmca for
+
+    Returns:
+        (bank_angles_deg, vmca_vals): Tuple of bank angles and corresponding Vmca values
+    """
     # --- Extract usable numeric Vmca if a dict was passed ---
     if isinstance(published_vmca, dict):
         published_vmca = published_vmca.get("clean_up") or next(iter(published_vmca.values()), None)
@@ -1197,102 +1316,183 @@ def calculate_vmca(
     if not isinstance(published_vmca, (int, float)):
         return bank_angles_deg, np.full_like(bank_angles_deg, np.nan)
 
+    # --- Calculate density altitude for altitude effects ---
+    isa_temp_c = TEMP_SL_C - (pressure_altitude * LAPSE_RATE_K_FT)
+    temp_dev_c = oat_c - isa_temp_c
+    density_altitude = pressure_altitude + (120 * temp_dev_c)
+
     # --- Base modifier (1.0 = no change from published) ---
     modifiers = np.ones_like(bank_angles_deg, dtype=float)
 
-    # Power effect
-    modifiers *= np.clip(0.7 + 0.3 * (power_fraction / 1.0), 0.7, 1.2)
+    # --- Power effect ---
+    # Lower power = less asymmetric thrust = lower Vmc
+    # At full power: modifier = 1.0 (published condition)
+    # At 50% power: modifier ≈ 0.85
+    # At idle: modifier ≈ 0.70
+    power_mod = 0.70 + 0.30 * power_fraction
+    modifiers *= np.clip(power_mod, 0.70, 1.05)
 
-    # Weight effect
-    weight_factor = reference_weight / total_weight
-    modifiers *= np.clip(weight_factor, 0.85, 1.15)
+    # --- Weight effect ---
+    # Lighter weight = less inertia to resist yaw = higher Vmc
+    # Published Vmc is at max gross, so lighter = higher Vmc
+    # Typical effect: ~1 kt per 100 lbs from max gross
+    weight_ratio = total_weight / reference_weight
+    # Invert: lighter (ratio < 1) should increase Vmc
+    weight_factor = 1.0 + 0.15 * (1.0 - weight_ratio)
+    modifiers *= np.clip(weight_factor, 0.90, 1.15)
 
-    # CG effect
+    # --- CG effect ---
+    # Aft CG = shorter moment arm for rudder = higher Vmc
+    # Published Vmc is typically at aft CG limit
+    # Forward CG improves directional control (lower Vmc)
     cg_span = cg_range[1] - cg_range[0]
     if cg_span > 0:
+        # cg_percent: 0 = forward limit, 1 = aft limit
         cg_percent = (cg - cg_range[0]) / cg_span
-        cg_penalty = 1.0 + (0.05 * cg_percent)
+        # At forward CG: slight reduction; at aft CG: baseline (published condition)
+        cg_factor = 0.96 + 0.04 * cg_percent
     else:
-        cg_penalty = 1.0
-    modifiers *= cg_penalty
+        cg_factor = 1.0
+    modifiers *= cg_factor
 
-    # Prop condition effect
-    if prop_condition == "windmilling":
-        modifiers *= 1.05
-    elif prop_condition == "stationary":
-        modifiers *= 1.02
-    elif prop_condition == "feathered":
-        modifiers *= 0.95
+    # --- Density altitude effect ---
+    # Higher DA = less power available from operating engine = lower Vmc
+    # Also less rudder effectiveness, but power effect dominates
+    # Typical: ~1% reduction per 3,000 ft DA
+    da_factor = 1.0 - (density_altitude / 30000.0) * 0.10
+    modifiers *= np.clip(da_factor, 0.85, 1.0)
 
-    # Bank angle effect
-    bank_mod = np.ones_like(bank_angles_deg)
+    # --- Prop condition effect ---
+    # Windmilling: max drag/yaw from dead engine = highest Vmc
+    # Feathered: minimum drag = lowest Vmc
+    prop_factors = {
+        "windmilling": 1.08,   # +8% - significant yaw from windmilling prop
+        "stationary": 1.03,    # +3% - some drag, no rotation
+        "feathered": 0.92      # -8% - minimum drag, best case
+    }
+    modifiers *= prop_factors.get(prop_condition, 1.0)
+
+    # --- Bank angle effect (refined model) ---
+    # The relationship between bank and Vmc is nonlinear:
+    # - Wings level (0°): High sideslip needed, moderate Vmc
+    # - 5° into dead engine: Optimal - sideslip eliminated, lowest Vmc
+    # - Bank away from dead engine (negative): Dramatically increases Vmc
+    # - Excessive bank into dead engine (>5°): Increases Vmc due to increased
+    #   load factor and loss of vertical lift component
+    bank_mod = np.ones_like(bank_angles_deg, dtype=float)
     for i, bank in enumerate(bank_angles_deg):
         if bank < 0:
-            bank_mod[i] *= 1.10
+            # Banking away from dead engine - significant Vmc increase
+            # Up to +15% at -5° bank
+            bank_mod[i] = 1.0 + 0.03 * abs(bank)
         elif 0 <= bank <= 5:
-            bank_mod[i] *= 1.0 - 0.04 * (bank / 5.0)
-        elif bank > 5:
-            bank_mod[i] *= 1.0 + 0.03 * ((bank - 5) / 5.0)
+            # Optimal range - Vmc decreases as bank approaches 5°
+            # Minimum at 5° (published condition)
+            bank_mod[i] = 1.0 - 0.04 * (bank / 5.0)
+        else:
+            # Beyond optimal bank - Vmc increases due to load factor
+            # Gradual increase: ~0.5% per degree beyond 5°
+            bank_mod[i] = 0.96 + 0.005 * (bank - 5)
+
     modifiers *= bank_mod
 
-    # Final Vmca array
+    # --- Final Vmca array ---
     vmca_vals = published_vmca * modifiers
 
     # Convert to MPH if needed
     if unit == "MPH":
-        vmca_vals = vmca_vals * 1.15078
+        vmca_vals = vmca_vals * KTS_TO_MPH
 
     return bank_angles_deg, vmca_vals
+
 
 def calculate_dynamic_vyse(
     published_vyse,
     total_weight,
     reference_weight,
-    altitude_ft,
-    gear_position,
-    flap_config,
-    prop_condition
+    pressure_altitude=0,
+    oat_c=15,
+    gear_position="up",
+    flap_config="clean",
+    prop_condition="feathered"
 ):
     """
-    Compute dynamic Vyse based on weight, altitude, gear, flaps, and prop condition.
-    - published_vyse: baseline Vyse (KIAS)
-    - total_weight: current aircraft weight
-    - reference_weight: weight at which Vyse is published (typically max gross)
-    - altitude_ft: current pressure altitude
-    - gear_position: "up" or "down"
-    - flap_config: e.g. "clean", "takeoff", "landing"
-    - prop_condition: "feathered", "windmilling"
+    Compute dynamic Vyse (best single-engine rate of climb speed) based on weight,
+    density altitude, configuration, and prop condition.
+
+    Physics basis:
+    - Vyse is the speed that provides best rate of climb with one engine inoperative
+    - It's determined by the point where excess thrust power is maximum
+    - Weight affects required lift and thus optimal L/D point
+    - Density altitude affects available power from operating engine
+    - Configuration (gear, flaps) affects drag and optimal speed
+
+    Args:
+        published_vyse: Baseline Vyse (KIAS) - typically at max gross, sea level
+        total_weight: Current aircraft weight (lbs)
+        reference_weight: Weight at which Vyse is published (typically max gross)
+        pressure_altitude: Pressure altitude in feet
+        oat_c: Outside air temperature in Celsius
+        gear_position: "up" or "down"
+        flap_config: "clean", "takeoff", or "landing"
+        prop_condition: "feathered", "stationary", or "windmilling"
+
+    Returns:
+        Adjusted Vyse in KIAS
     """
+    # --- Calculate density altitude ---
+    isa_temp_c = TEMP_SL_C - (pressure_altitude * LAPSE_RATE_K_FT)
+    temp_dev_c = oat_c - isa_temp_c
+    density_altitude = pressure_altitude + (120 * temp_dev_c)
 
-    # --- Weight effect: Vyse increases as weight increases (less climb margin)
-    weight_factor = min(max(total_weight / reference_weight, 0.9), 1.1)  # ±10% effect
+    # --- Weight effect ---
+    # Heavier aircraft needs to fly faster for optimal L/D
+    # Vyse scales approximately with sqrt(weight ratio) for constant L/D
+    # Simplified: ~5% change for 10% weight change
+    weight_ratio = total_weight / reference_weight
+    weight_factor = 1.0 + 0.5 * (weight_ratio - 1.0)
+    weight_factor = np.clip(weight_factor, 0.92, 1.08)
 
-    # --- Altitude effect: Vyse tends to increase with altitude (lower excess power)
-    altitude_factor = 1.0 + (altitude_ft / 10000.0) * 0.02  # ~2% per 10,000 ft
+    # --- Density altitude effect (refined) ---
+    # At higher DA, TAS increases for same IAS, but available power decreases
+    # The optimal IAS actually decreases slightly at altitude because:
+    # - Less power available means flying at lower speed for best L/D
+    # - But also less margin, so slightly higher IAS for safety
+    # Net effect: very small change, approximately +0.5% per 5,000 ft DA
+    # This is much less than the original 2% per 10,000 ft
+    da_factor = 1.0 + (density_altitude / 50000.0) * 0.05
+    da_factor = np.clip(da_factor, 1.0, 1.03)
 
-    # --- Gear effect: gear down = more drag = higher Vyse
-    gear_factor = 1.04 if gear_position == "down" else 1.0  # +4% if gear down
+    # --- Gear effect ---
+    # Gear down = more drag = shifts L/D curve right = higher Vyse
+    # Typical effect: +3-5% with gear down
+    gear_factor = 1.04 if gear_position == "down" else 1.0
 
-    # --- Flap effect: more flaps = higher Vyse (more drag)
-    flap_penalty = {
+    # --- Flap effect ---
+    # Flaps increase both lift and drag, shifting optimal speed
+    # More flaps = more drag penalty = higher optimal speed
+    flap_factors = {
         "clean": 1.00,
-        "takeoff": 1.03,
-        "landing": 1.06
+        "takeoff": 1.02,    # Small increase
+        "landing": 1.05     # Larger increase due to more drag
     }
-    config_factor = flap_penalty.get(flap_config, 1.00)
+    config_factor = flap_factors.get(flap_config, 1.00)
 
-    if prop_condition == "windmilling":
-        prop_factor = 1.05  # Highest drag penalty
-    elif prop_condition == "feathered":
-        prop_factor = 0.95  # Most efficient
-    elif prop_condition == "stationary":
-        prop_factor = 1.02  # Midpoint — more drag than feathered, less than windmilling
+    # --- Prop condition effect ---
+    # Dead engine prop condition affects total drag
+    # More drag from dead engine = need to fly slightly faster
+    prop_factors = {
+        "feathered": 0.98,    # Minimum drag - can fly slightly slower
+        "stationary": 1.02,   # Moderate drag
+        "windmilling": 1.05   # Maximum drag - need more speed
+    }
+    prop_factor = prop_factors.get(prop_condition, 1.0)
 
-    # --- Final dynamic Vyse
+    # --- Final dynamic Vyse ---
     adjusted_vyse = (
         published_vyse
         * weight_factor
-        * altitude_factor
+        * da_factor
         * gear_factor
         * config_factor
         * prop_factor
@@ -1310,23 +1510,26 @@ def calculate_dynamic_vyse(
     Input("altitude-slider", "value"),
     Input("stored-total-weight", "data"),
     Input("power-setting", "value"),
-    Input("overlay-toggle", "value"),
+    Input("overlay-toggle", "data"),
     Input("gear-select", "value"),
     Input("oei-toggle", "value"),
-    Input("prop-condition", "value"),
+    Input("prop-condition", "data"),
     Input("cg-slider", "value"),
     Input("category-select", "value"),
-    Input("unit-select", "value"),
-    Input("multi-engine-toggle-options", "value"),
+    Input("unit-select", "data"),
+    Input("multi-engine-toggle-options", "data"),
     Input("maneuver-select", "value"),
     Input({"type": "steepturn-aob", "index": ALL}, "value"),
     Input({"type": "steepturn-ias", "index": ALL}, "value"),
+    Input({"type": "steepturn-standard", "index": ALL}, "value"),
     Input({"type": "steepturn-ghost", "index": ALL}, "value"),
     Input({"type": "chandelle-ias", "index": ALL}, "value"),
     Input({"type": "chandelle-bank", "index": ALL}, "value"),
     Input({"type": "chandelle-ghost", "index": ALL}, "value"),
     Input("pitch-angle", "value"),
     Input("screen-width", "data"),
+    Input("oat-input", "value"),
+    Input("altimeter-input", "value"),
 )
 
 def update_graph(
@@ -1347,15 +1550,17 @@ def update_graph(
     unit,
     multi_engine_toggle_options,
     maneuver,
-    aob_values,             
+    aob_values,
     ias_values,
-    ghost_mode_values,
+    steepturn_standard_values,
+    steepturn_ghost_values,
     chandelle_ias_values,
     chandelle_bank_values,
     chandelle_ghost_values,
     pitch_angle,
-    screen_width
-    
+    screen_width,
+    oat_c,
+    altimeter_inhg
 ):
     t_start = time.perf_counter()
     import plotly.graph_objects as go  # <== you must ensure this is imported here if not at top of file
@@ -1375,7 +1580,9 @@ def update_graph(
         aob_ias_step = 0.5     # 0.5 kt increments
         aob_tr_step = 0.5      # 0.5 deg/s increments
 
-
+    # Handle None values for overlay lists
+    overlay_toggle = overlay_toggle if overlay_toggle is not None else []
+    multi_engine_toggle_options = multi_engine_toggle_options if multi_engine_toggle_options is not None else []
 
     all_overlays = overlay_toggle + multi_engine_toggle_options
 
@@ -1385,11 +1592,10 @@ def update_graph(
     if engine_name is None or engine_name not in aircraft_data[ac_name]["engine_options"]:
         raise PreventUpdate
 
-    KIAS_to_MPH = 1.15078
     def convert_display_airspeed(ias_vals, unit):
-        return ias_vals * KIAS_to_MPH if unit == "MPH" else ias_vals
+        return ias_vals * KTS_TO_MPH if unit == "MPH" else ias_vals
     def convert_input_airspeed(ias_vals, unit):
-        return ias_vals / KIAS_to_MPH if unit == "MPH" else ias_vals
+        return ias_vals / KTS_TO_MPH if unit == "MPH" else ias_vals
     
     if not ac_name or ac_name not in aircraft_data:
         raise PreventUpdate
@@ -1503,10 +1709,10 @@ def update_graph(
         xaxis=dict(showgrid=True),
         yaxis=dict(showgrid=True),
         dragmode=False,             # ✅ disables box zoom drag
-        hovermode="closest"         # ✅ enables hover tooltips
+        hovermode="closest",        # ✅ enables hover tooltips
+        autosize=True               # ✅ responsive sizing
     )
     
-    g = 32.174
     # --- CG Effects ---
     cl_base = ac["CL_max"][config]
     cg_min_val, cg_max_val = ac["cg_range"]
@@ -1526,17 +1732,37 @@ def update_graph(
         "cg_drag_factor": cg_drag_factor
     })
 
-    
+
     wing_area = ac["wing_area"]
-    lapse_rate = 0.0019812
-    rho0 = 0.002377
-    temp_K = 288.15 - lapse_rate * altitude_ft
-    rho = rho0 * (temp_K / 288.15) ** 4.256
+    # Aircraft drag/lift parameters - used throughout update_graph
+    CD0 = ac.get("CD0", 0.025)
+    e = ac.get("e", 0.8)
+    AR = ac.get("aspect_ratio", 7.5)
+
+    # === Environment calculations using OAT and altimeter ===
+    # Default values if not provided
+    oat_c = oat_c if oat_c is not None else 15
+    altimeter_inhg = altimeter_inhg if altimeter_inhg is not None else 29.92
+
+    # Calculate pressure altitude from field elevation and altimeter
+    pressure_altitude = compute_pressure_altitude(altitude_ft, altimeter_inhg)
+
+    # Use centralized air density calculation with OAT for accurate density
+    rho = compute_air_density(pressure_altitude, oat_c)
+
+    dprint("ENVIRONMENT DEBUG:", {
+        "field_elev_ft": altitude_ft,
+        "oat_c": oat_c,
+        "altimeter_inhg": altimeter_inhg,
+        "pressure_altitude": pressure_altitude,
+        "density_altitude": compute_density_altitude(pressure_altitude, oat_c),
+        "rho": rho
+    })
 
     stall_data = ac.get("stall_speeds", {}).get(config, {})
-    vs_values = stall_data.get("speeds", [])
-    vs_min = min(vs_values) if vs_values else 30
-    ias_start = max(0, int(vs_min * 0.7))
+    # Use weight-interpolated stall speed instead of just minimum
+    vs_1g = interpolate_stall_speed(stall_data, weight) if stall_data else 30
+    ias_start = max(0, int(vs_1g * 0.7))
 
     if config == "clean":
         max_speed = ac.get("Vne", 200)
@@ -1548,23 +1774,26 @@ def update_graph(
     max_speed_internal = max_speed  # always in KIAS for physics
     max_speed_display = convert_display_airspeed(max_speed, unit)
 
-    vs_values = stall_data.get("speeds", [])
-    vs_min = min(vs_values) if vs_values else 30
-    ias_start = max(0, int(vs_min * 0.8))  # Add dynamic padding (20% below Vs)
+    ias_start = max(0, int(vs_1g * 0.8))  # Add dynamic padding (20% below Vs)
     ias_vals = np.arange(ias_start, max_speed + 1, 1)
     ias_vals_display = convert_display_airspeed(ias_vals, unit)
     
     g_curve_x, g_curve_y = [], []
     for ias in ias_vals:
-        v = ias * 1.68781
+        v = ias * KTS_TO_FPS
         omega = g * ((g_limit**2 - 1) ** 0.5) / v
         tr = omega * 180 / pi
         g_curve_x.append(ias)
         g_curve_y.append(tr)
 
     stall_x, stall_y = [], []
-    for ias in ias_vals:
-        v = ias * 1.68781
+    # Use finer steps near stall speed for smoother curve, coarser elsewhere
+    stall_ias_fine = np.concatenate([
+        np.arange(ias_start, vs_1g + 15, 0.5),  # Fine steps near stall
+        np.arange(vs_1g + 15, max_speed + 1, 2)  # Coarser steps elsewhere
+    ])
+    for ias in stall_ias_fine:
+        v = ias * KTS_TO_FPS
         n_stall = (0.5 * rho * v**2 * wing_area * cl_max) / weight
         if n_stall >= 1:
             omega = g * ((n_stall**2 - 1) ** 0.5) / v
@@ -1604,16 +1833,64 @@ def update_graph(
     oei_active = "enabled" in oei_toggle
     prop_mode = prop_condition if oei_active else None
 
-    
+    # === Early DVmc calculation to modify flight envelope ===
+    dvmc_active = False
+    if "vmca" in all_overlays and ac.get("engine_count", 1) > 1 and oei_active:
+        dvmc_active = True
+        published_vmca_early = ac.get("single_engine_limits", {}).get("Vmca", 70)
+        reference_weight_early = ac.get("max_weight", 3600)
+        cg_range_early = ac.get("cg_range", [10, 20])
+
+        # Calculate DVmc curve
+        bank_angles_early = np.linspace(5, 90, 150)
+        _, vmca_vals_kias_early = calculate_vmca(
+            published_vmca=published_vmca_early,
+            power_fraction=power_fraction,
+            total_weight=weight,
+            reference_weight=reference_weight_early,
+            cg=cg,
+            cg_range=cg_range_early,
+            prop_condition=prop_mode,
+            pressure_altitude=pressure_altitude,
+            oat_c=oat_c,
+            bank_angles_deg=bank_angles_early
+        )
+
+        # Convert to turn rates
+        v_fts_early = vmca_vals_kias_early * KTS_TO_FPS
+        bank_rad_early = np.radians(bank_angles_early)
+        omega_rad_early = g * np.tan(bank_rad_early) / v_fts_early
+        turn_rates_early = np.degrees(omega_rad_early)
+
+        # Modify stall boundary where DVmc is more restrictive
+        stall_clipped_x_modified = []
+        stall_clipped_y_modified = []
+
+        for ias_stall, tr_stall in zip(stall_clipped_x, stall_clipped_y):
+            # Interpolate DVmc speed at this turn rate
+            if tr_stall >= min(turn_rates_early) and tr_stall <= max(turn_rates_early):
+                dvmc_at_tr = np.interp(tr_stall, turn_rates_early, vmca_vals_kias_early)
+                # Use max(stall, dvmc) as the effective boundary
+                effective_ias = max(ias_stall, dvmc_at_tr)
+            else:
+                effective_ias = ias_stall
+            stall_clipped_x_modified.append(effective_ias)
+            stall_clipped_y_modified.append(tr_stall)
+
+        # Replace stall boundary with modified version
+        stall_clipped_x = stall_clipped_x_modified
+        stall_clipped_y = stall_clipped_y_modified
+
     stall_clipped_x_display = convert_display_airspeed(np.array(stall_clipped_x), unit)
     g_clipped_x_display = convert_display_airspeed(np.array(g_clipped_x), unit)
     corner_ias_display = convert_display_airspeed(corner_ias, unit)
 
     if "negative_g" in overlay_toggle:
         # === Negative Lift Limit Curve ===
+        # Use same fine steps near stall as positive boundary for consistency
         neg_stall_x, neg_stall_y = [], []
-        for ias in ias_vals:
-            v = ias * 1.68781
+        for ias in stall_ias_fine:
+            v = ias * KTS_TO_FPS
             n_stall = (0.5 * rho * v**2 * wing_area * -cl_max) / weight
             if n_stall <= -1:
                 # Compute turn rate, limit to G envelope
@@ -1637,7 +1914,7 @@ def update_graph(
         # === Negative G-Limit Curve ===
         neg_g_x, neg_g_y = [], []
         for ias in ias_vals:
-            v = ias * 1.68781
+            v = ias * KTS_TO_FPS
             try:
                 omega = g * np.sqrt(g_limit_neg**2 - 1) / v
                 tr = -omega * 180 / pi
@@ -1683,12 +1960,34 @@ def update_graph(
         y_max = max(g_clipped_y) * 1.1 if g_clipped_y else 100
         y_min = 0
 
+    # Lift Limit - color changes when DVmc modifies the boundary
+    lift_limit_color = "#DC143C" if dvmc_active else "red"
+    lift_limit_name = "Lift Limit (DVmc)" if dvmc_active else "Lift Limit"
     fig.add_trace(go.Scatter(x=stall_clipped_x_display, y=stall_clipped_y,
-        mode="lines", name="Lift Limit", line=dict(color="red", width=3), hoverinfo="skip")),
+        mode="lines", name=lift_limit_name, line=dict(color=lift_limit_color, width=3), hoverinfo="skip")),
     fig.add_trace(go.Scatter(x=g_clipped_x_display, y=g_clipped_y,
         mode="lines", name=f"Load Limit ({g_limit:.1f} G)", line=dict(color="black", width=3, dash="solid"), hoverinfo="skip")),
     fig.add_trace(go.Scatter(x=[corner_ias_display], y=[corner_tr],
         mode="markers", name=f"Corner Speed ({corner_ias_display:.0f} {unit})", marker=dict(color="orange", size=9, symbol="x"), hoverinfo="skip")),
+
+    # Corner speed tick mark on x-axis
+    fig.add_shape(
+        type="line",
+        x0=corner_ias_display, x1=corner_ias_display,
+        y0=0, y1=-0.015,
+        xref="x", yref="paper",
+        line=dict(color="orange", width=1.5)
+    )
+    # Corner speed annotation on x-axis (inline with tick labels)
+    fig.add_annotation(
+        x=corner_ias_display,
+        y=-0.06,
+        yref="paper",
+        xref="x",
+        text=f"<b>{corner_ias_display:.0f}</b>",
+        showarrow=False,
+        font=dict(size=11, color="orange"),
+    )
 
   # --- Interpolate Vne Y-positions (always present) ---
     vne_y_top = np.interp(max_speed, g_clipped_x, g_clipped_y) if g_clipped_x and g_clipped_y else 0
@@ -1718,15 +2017,23 @@ def update_graph(
         for g_inter in intermediate_gs:
             gx, gy = [], []
             for ias in ias_vals:
-                v = ias * 1.68781
+                v = ias * KTS_TO_FPS
                 stall_v = np.sqrt((2 * weight * g_inter) / (rho * wing_area * cl_max))
                 if v < stall_v:
                     continue
                 omega = g * np.sqrt(g_inter**2 - 1) / v
                 tr = omega * 180 / pi
-                gx.append(ias)
-                gy.append(tr)
-                
+
+                # Check DVmc limit when active
+                dvmc_ok = True
+                if dvmc_active:
+                    dvmc_at_tr = np.interp(tr, turn_rates_early, vmca_vals_kias_early)
+                    dvmc_ok = ias >= dvmc_at_tr
+
+                if dvmc_ok:
+                    gx.append(ias)
+                    gy.append(tr)
+
             if len(gx) > 5:
                 gx_display = convert_display_airspeed(np.array(gx), unit)
                 fig.add_trace(go.Scatter(
@@ -1749,7 +2056,7 @@ def update_graph(
         for g_inter in neg_intermediate_gs:
             gx, gy = [], []
             for ias in ias_vals:
-                v = ias * 1.68781
+                v = ias * KTS_TO_FPS
                 stall_v = np.sqrt((2 * weight * abs(g_inter)) / (rho * wing_area * cl_max))
                 if v < stall_v:
                     continue
@@ -1787,7 +2094,7 @@ def update_graph(
         if steep_turn_override:
             aob_deg = aob_values[0]
             aob_rad = np.radians(aob_deg)
-            V = ias_vals_ps_internal * 1.68781
+            V = ias_vals_ps_internal * KTS_TO_FPS
             TR_fixed = np.degrees(g * np.tan(aob_rad) / V)  # TR as a function of IAS
             TR = np.tile(TR_fixed, (len(ias_vals_ps_internal), 1)).T  # 2D grid shape
             IAS = np.tile(ias_vals_ps_internal, (len(TR), 1))
@@ -1796,7 +2103,7 @@ def update_graph(
             tr_vals_ps = np.arange(-100, 100, 1)
             IAS, TR = np.meshgrid(ias_vals_ps_internal, tr_vals_ps)
 
-        V = IAS * 1.68781  # convert to ft/s
+        V = IAS * KTS_TO_FPS  # convert to ft/s
         omega_rad = TR * (np.pi / 180)
         n = np.sqrt(1 + (V * omega_rad / g) ** 2)
 
@@ -1820,27 +2127,35 @@ def update_graph(
         V_vertical = V * np.sin(gamma_rad)
 
         # Ps in knots per second
-        Ps = ((T_available - D) * V / weight - V_vertical) / 1.68781
+        Ps = ((T_available - D) * V / weight - V_vertical) * FPS_TO_KTS
 
         # Envelope mask (vectorized)
-        v_fts_env = IAS * 1.68781
+        v_fts_env = IAS * KTS_TO_FPS
         omega_rad_env = TR * (np.pi / 180)
 
         n_env = np.sqrt(1 + (v_fts_env * omega_rad_env / g) ** 2)
         stall_v_fts_env = np.sqrt((2 * weight * n_env) / (rho * wing_area * cl_max))
-        stall_ias_env = stall_v_fts_env / 1.68781
+        stall_ias_env = stall_v_fts_env * FPS_TO_KTS
 
         tr_limit_pos_env = g * np.sqrt(g_limit**2 - 1) / v_fts_env * 180 / np.pi
         tr_limit_neg_env = g * np.sqrt(g_limit_neg**2 - 1) / v_fts_env * 180 / np.pi
 
         valid_pos = (TR >= 0) & (TR <= tr_limit_pos_env)
-        valid_neg = (TR < 0) & (TR >= tr_limit_neg_env)
+        valid_neg = (TR < 0) & (TR >= -tr_limit_neg_env)  # Negate limit for negative TR region
 
+        # Base envelope mask
         within_env = (
             (IAS >= stall_ias_env) &
             (IAS <= max_speed_internal) &
             (valid_pos | valid_neg)
         )
+
+        # Add DVmc masking when active
+        if dvmc_active:
+            # For each point, check if IAS >= DVmc at that turn rate
+            dvmc_ias_at_tr = np.interp(TR, turn_rates_early, vmca_vals_kias_early)
+            dvmc_mask = IAS >= dvmc_ias_at_tr
+            within_env = within_env & dvmc_mask
 
         # Ps_masked = usable Ps; outside envelope = NaN
         Ps_masked = np.where(within_env, Ps, np.nan)
@@ -1866,9 +2181,9 @@ def update_graph(
         IAS_vals = np.arange(ias_start, max_speed + 1, aob_ias_step)
         IAS_vals_display = convert_display_airspeed(IAS_vals, unit)
         ias_vals_display = convert_display_airspeed(ias_vals, unit)
-        TR_vals = np.arange(1, 100, aob_tr_step)
+        TR_vals = np.arange(0.1, 100, aob_tr_step)  # Start near 0 for full coverage
         IAS, TR = np.meshgrid(IAS_vals, TR_vals)
-        V = IAS * 1.68781
+        V = IAS * KTS_TO_FPS
         omega_rad = TR * (np.pi / 180)
 
         # Compute angle of bank at each point
@@ -1880,10 +2195,17 @@ def update_graph(
         n = np.maximum(n, 1.001)  # Enforce minimum 1 G load factor
 
         stall_v = np.sqrt((2 * weight * n) / (rho * wing_area * cl_max))
-        stall_IAS = stall_v / 1.68781
+        stall_IAS = stall_v * FPS_TO_KTS
         tr_limit = g * np.sqrt(g_limit**2 - 1) / V * 180 / pi
 
         mask = (IAS >= stall_IAS) & (TR <= tr_limit) & (IAS <= max_speed)
+
+        # Add DVmc masking when active
+        if dvmc_active:
+            dvmc_ias_at_tr = np.interp(TR, turn_rates_early, vmca_vals_kias_early)
+            dvmc_mask = IAS >= dvmc_ias_at_tr
+            mask = mask & dvmc_mask
+
         AOB_masked = np.where(mask, AOB_deg, np.nan)
 
         # Plot AOB heatmap
@@ -1909,10 +2231,10 @@ def update_graph(
         ))
         # --- AOB HEATMAP (Negative Turn Rates) ---
         if "aob" in overlay_toggle and "negative_g" in overlay_toggle:
-            TR_vals_neg = np.arange(-100, -1, aob_tr_step)
+            TR_vals_neg = np.arange(-100, -0.1, aob_tr_step)  # End near 0 for full coverage
             IAS_vals_neg = np.arange(ias_start, max_speed + 1, aob_ias_step)
             IAS_neg, TR_neg = np.meshgrid(IAS_vals_neg, TR_vals_neg)
-            V_neg = IAS_neg * 1.68781
+            V_neg = IAS_neg * KTS_TO_FPS
             omega_rad_neg = np.abs(TR_neg) * (np.pi / 180)  # use absolute to mirror
 
             AOB_rad_neg = np.arctan(omega_rad_neg * V_neg / g)
@@ -1921,7 +2243,7 @@ def update_graph(
             n_neg = np.sqrt(1 + (V_neg * omega_rad_neg / g) ** 2)
             n_neg = np.maximum(n_neg, 1.001)
             stall_v_neg = np.sqrt((2 * weight * n_neg) / (rho * wing_area * cl_max))
-            stall_IAS_neg = stall_v_neg / 1.68781
+            stall_IAS_neg = stall_v_neg * FPS_TO_KTS
             tr_limit_neg = g * np.sqrt(g_limit_neg**2 - 1) / V_neg * 180 / pi
 
             mask_neg = (IAS_neg >= stall_IAS_neg) & (np.abs(TR_neg) <= tr_limit_neg) & (IAS_neg <= max_speed)
@@ -1949,14 +2271,14 @@ def update_graph(
         # --- Step 1a: Dynamically find smallest valid turn radius inside envelope
         min_radius = None
         for ias in np.arange(ias_start, max_speed + 1, 0.5):  # fine IAS sweep
-            v_fts = ias * 1.68781
+            v_fts = ias * KTS_TO_FPS
             for tr_candidate in np.arange(60, 1, -0.5):  # from tightest turns down
                 omega_rad = tr_candidate * (np.pi / 180)
                 r = v_fts / omega_rad
 
                 n = np.sqrt(1 + (v_fts * omega_rad / g) ** 2)
                 stall_v_fts = np.sqrt((2 * weight * n) / (rho * wing_area * cl_max))
-                stall_ias = stall_v_fts / 1.68781
+                stall_ias = stall_v_fts * FPS_TO_KTS
                 tr_limit = g * np.sqrt(g_limit**2 - 1) / v_fts * 180 / np.pi
 
                 if ias >= stall_ias and tr_candidate <= tr_limit and ias <= max_speed:
@@ -1967,13 +2289,13 @@ def update_graph(
         # --- Step 1b: Compute max radius using 3 deg/sec
         max_radius = 0
         for ias in ias_range:
-            v_fts = ias * 1.68781
+            v_fts = ias * KTS_TO_FPS
             omega_3deg = 3 * (np.pi / 180)
             r = v_fts / omega_3deg
 
             n = np.sqrt(1 + (v_fts * omega_3deg / g) ** 2)
             stall_v_fts = np.sqrt((2 * weight * n) / (rho * wing_area * cl_max))
-            stall_ias = stall_v_fts / 1.68781
+            stall_ias = stall_v_fts * FPS_TO_KTS
             tr_limit = g * np.sqrt(g_limit ** 2 - 1) / v_fts * 180 / np.pi
 
             if ias >= stall_ias and 3 <= tr_limit and ias <= max_speed:
@@ -1998,16 +2320,22 @@ def update_graph(
             valid_y = []
 
             for ias in ias_range:
-                v_fts = ias * 1.68781
+                v_fts = ias * KTS_TO_FPS
                 omega_rad = v_fts / radius
                 tr_deg = omega_rad * 180 / pi
 
                 n = np.sqrt(1 + (v_fts * omega_rad / g) ** 2)
                 stall_v_fts = np.sqrt((2 * weight * n) / (rho * wing_area * cl_max))
-                stall_ias = stall_v_fts / 1.68781
+                stall_ias = stall_v_fts * FPS_TO_KTS
                 tr_limit = g * np.sqrt(g_limit**2 - 1) / v_fts * 180 / pi
 
-                if ias >= stall_ias and tr_deg <= tr_limit and ias <= max_speed:
+                # Check DVmc limit when active
+                dvmc_ok = True
+                if dvmc_active:
+                    dvmc_at_tr = np.interp(tr_deg, turn_rates_early, vmca_vals_kias_early)
+                    dvmc_ok = ias >= dvmc_at_tr
+
+                if ias >= stall_ias and tr_deg <= tr_limit and ias <= max_speed and dvmc_ok:
                     valid_x.append(convert_display_airspeed(ias, unit))
                     valid_y.append(tr_deg)
 
@@ -2030,7 +2358,6 @@ def update_graph(
                     bgcolor="rgba(255,255,255,0.5)",
                     borderpad=1,
                 )
-        vs_min = min(vs_values) if vs_values else 30
         x_min = ias_start
         x_max = max_speed * 1.1
         y_max = (
@@ -2053,14 +2380,14 @@ def update_graph(
 
             # Step 1a: Find tightest valid negative radius
             for ias in np.arange(ias_start, max_speed + 1, 0.5):
-                v_fts = ias * 1.68781
+                v_fts = ias * KTS_TO_FPS
                 for tr_candidate in np.arange(60, 1, -0.5):
                     omega_rad = tr_candidate * (np.pi / 180)
                     r = v_fts / omega_rad
 
                     n = np.sqrt(1 + (v_fts * omega_rad / g) ** 2)
                     stall_v_fts = np.sqrt((2 * weight * n) / (rho * wing_area * cl_max))
-                    stall_ias = stall_v_fts / 1.68781
+                    stall_ias = stall_v_fts * FPS_TO_KTS
                     tr_limit = g * np.sqrt(g_limit_neg**2 - 1) / v_fts * 180 / np.pi
 
                     if ias >= stall_ias and tr_candidate <= tr_limit and ias <= max_speed:
@@ -2071,13 +2398,13 @@ def update_graph(
 
             # Step 1b: Max radius using 3 deg/sec
             for ias in ias_vals:
-                v_fts = ias * 1.68781
+                v_fts = ias * KTS_TO_FPS
                 omega_3deg = 3 * (np.pi / 180)
                 r = v_fts / omega_3deg
 
                 n = np.sqrt(1 + (v_fts * omega_3deg / g) ** 2)
                 stall_v_fts = np.sqrt((2 * weight * n) / (rho * wing_area * cl_max))
-                stall_ias = stall_v_fts / 1.68781
+                stall_ias = stall_v_fts * FPS_TO_KTS
                 tr_limit = g * np.sqrt(g_limit_neg**2 - 1) / v_fts * 180 / np.pi
 
                 if ias >= stall_ias and 3 <= tr_limit and ias <= max_speed:
@@ -2092,13 +2419,13 @@ def update_graph(
                 neg_valid_x, neg_valid_y = [], []
 
                 for ias in ias_vals:
-                    v_fts = ias * 1.68781
+                    v_fts = ias * KTS_TO_FPS
                     omega_rad = v_fts / radius
                     tr_deg = -omega_rad * 180 / pi
 
                     n = np.sqrt(1 + (v_fts * omega_rad / g) ** 2)
                     stall_v = np.sqrt((2 * weight * n) / (rho * wing_area * cl_max))
-                    stall_ias = stall_v / 1.68781
+                    stall_ias = stall_v * FPS_TO_KTS
                     tr_limit = g * np.sqrt(g_limit_neg**2 - 1) / v_fts * 180 / pi
 
                     if ias >= stall_ias and abs(tr_deg) <= tr_limit and ias <= max_speed:
@@ -2133,7 +2460,7 @@ def update_graph(
         reference_weight = ac.get("max_weight", 3600)
         cg_range = ac.get("cg_range", [10, 20])
 
-        # Sweep bank angle from -5° to 90° (beyond published + best-case)
+        # Sweep bank angle from 5° to 90°
         bank_angles = np.linspace(5, 90, 150)
 
         _, vmca_vals_kias = calculate_vmca(
@@ -2144,69 +2471,76 @@ def update_graph(
             cg=cg,
             cg_range=cg_range,
             prop_condition=prop_mode,
+            pressure_altitude=pressure_altitude,
+            oat_c=oat_c,
             bank_angles_deg=bank_angles
         )
 
-        vmca_vals_display = convert_display_airspeed(vmca_vals_kias, unit)
+        vmca_vals_display_full = convert_display_airspeed(vmca_vals_kias, unit)
 
         # Convert bank angle to turn rate
-        v_fts = vmca_vals_kias * 1.68781
+        v_fts = vmca_vals_kias * KTS_TO_FPS
         bank_rad = np.radians(bank_angles)
         omega_rad = g * np.tan(bank_rad) / v_fts
-        turn_rates = np.degrees(omega_rad)
+        turn_rates_full = np.degrees(omega_rad)
 
-        # ✅ Clip to envelope before plotting
-        envelope_mask = (vmca_vals_display >= corner_ias_display) & (vmca_vals_display <= max_speed_display)
-        valid_mask = (turn_rates >= y_min) & (turn_rates <= y_max)
-        vmca_vals_display = vmca_vals_display[valid_mask]
-        turn_rates = turn_rates[valid_mask]
+        # Save first point for label (before clipping)
+        dvmc_label_value = vmca_vals_display_full[0]
+        dvmc_label_tr = turn_rates_full[0]
 
-        fig.add_trace(go.Scatter(
-            x=vmca_vals_display,
-            y=turn_rates,
-            mode="lines",
-            name="Dynamic Vmc",
-            line=dict(color="red", width=2.5, dash="dash"),
-            hoverinfo="skip",
-            showlegend=True
-        ))
+        # ✅ Clip to envelope before plotting - must be within lift limit (stall boundary)
+        stall_tr_limit = np.interp(vmca_vals_kias, stall_clipped_x, stall_clipped_y)
+        valid_mask = (turn_rates_full >= y_min) & (turn_rates_full <= y_max) & (turn_rates_full <= stall_tr_limit)
+        vmca_vals_display = vmca_vals_display_full[valid_mask]
+        turn_rates = turn_rates_full[valid_mask]
 
+        # Build hover text with bank angle info
+        bank_angles_masked = bank_angles[valid_mask]
+        vmca_hover = [
+            f"<b>DVmc</b><br>Bank: {bank:.0f}°<br>Vmca: {spd:.0f} {unit}<br>Turn Rate: {tr:.1f}°/s"
+            for bank, spd, tr in zip(bank_angles_masked, vmca_vals_display, turn_rates)
+        ]
+
+        # Plot DVmc line (clipped portion only)
         if len(vmca_vals_display) > 0:
-            fig.add_annotation(
-                x=vmca_vals_display[-1],
-                y=turn_rates[-1] + 2,
-                text="Vmca ↑",
-                showarrow=False,
-                font=dict(size=10, color="red"),
-                bgcolor="rgba(255,255,255,0.8)",
-                xanchor="left"
-            )
-
-            first_vmca_display = vmca_vals_display[0]
-            first_turn_rate = turn_rates[0]
-
             fig.add_trace(go.Scatter(
-                x=[first_vmca_display],
-                y=[first_turn_rate],
-                mode="markers",
-                marker=dict(color="red", size=8, symbol="circle"),
-                name="Dynamic Vmca",
-                showlegend=False,
-                hoverinfo="skip"
+                x=vmca_vals_display,
+                y=turn_rates,
+                mode="lines",
+                name="DVmc",
+                line=dict(color="#DC143C", width=2.5, dash="dash"),
+                hoverinfo="text",
+                hovertext=vmca_hover,
+                showlegend=True
             ))
 
-            fig.add_annotation(
-                x=first_vmca_display + 2,
-                y=first_turn_rate,
-                text=f"DVmc: {first_vmca_display:.0f} {unit}",
-                showarrow=True,
-                arrowhead=1,
-                ax=40,
-                ay=-20,
-                font=dict(size=10, color="red"),
-                bgcolor="rgba(255,255,255,0.8)",
-                borderpad=3
-            )
+        # Always show DVmc label with calculated value (even if off scale)
+        # Position at edge of graph if value is beyond visible range
+        estimated_x_max = max_speed * 1.1 if unit == "KIAS" else max_speed * KTS_TO_MPH * 1.1
+
+        if dvmc_label_value > estimated_x_max:
+            # DVmc is off scale - position label at right edge with actual value
+            label_x_pos = estimated_x_max * 0.95
+            label_text = f"<b>DVmc {dvmc_label_value:.0f}</b> →"
+            arrow_x = 30  # Point arrow to the right
+        else:
+            label_x_pos = dvmc_label_value
+            label_text = f"<b>DVmc</b> {dvmc_label_value:.0f}"
+            arrow_x = -45
+
+        fig.add_annotation(
+            x=label_x_pos,
+            y=min(dvmc_label_tr, y_max * 0.95),  # Keep label visible within plot
+            text=label_text,
+            showarrow=True,
+            arrowhead=2,
+            ax=arrow_x,
+            ay=15,
+            font=dict(size=10, color="#DC143C"),
+            bgcolor="rgba(255,255,255,0.9)",
+            borderpad=3
+        )
+
     # === Dynamic Vyse Marker and Curve ===
     if "dynamic_vyse" in all_overlays and ac.get("engine_count", 1) > 1 and oei_active:
         vyse_block = ac.get("single_engine_limits", {}).get("Vyse", {})
@@ -2226,7 +2560,8 @@ def update_graph(
                 published_vyse=published_vyse,
                 total_weight=weight,
                 reference_weight=reference_weight,
-                altitude_ft=altitude_ft,
+                pressure_altitude=pressure_altitude,
+                oat_c=oat_c,
                 gear_position=gear,
                 flap_config=config,
                 prop_condition=prop_mode
@@ -2234,88 +2569,92 @@ def update_graph(
             vyse_curve.append(vyse_val * angle_penalty)
 
         vyse_curve = np.clip(vyse_curve, min(g_curve_x), max(g_curve_x))
-        vyse_display_curve = convert_display_airspeed(np.array(vyse_curve), unit)
+        vyse_display_curve_full = convert_display_airspeed(np.array(vyse_curve), unit)
 
-        v_fts = np.array(vyse_curve) * 1.68781
+        v_fts = np.array(vyse_curve) * KTS_TO_FPS
         bank_rad = np.radians(bank_angles)
         omega_rad = g * np.tan(bank_rad) / v_fts
-        turn_rates = np.degrees(omega_rad)
+        turn_rates_full = np.degrees(omega_rad)
 
-        # ✅ NOW apply valid_mask after definitions
-        envelope_mask = (vyse_display_curve >= corner_ias_display) & (vyse_display_curve <= max_speed_display)
-        valid_mask = (turn_rates >= y_min) & (turn_rates <= y_max)
-        vyse_display_curve = vyse_display_curve[valid_mask]
-        turn_rates = turn_rates[valid_mask]
+        # Save first point for label (before clipping)
+        dvyse_label_value = vyse_display_curve_full[0]
+        dvyse_label_tr = turn_rates_full[0]
 
-        # --- Plot
-        fig.add_trace(go.Scatter(
-            x=vyse_display_curve,
-            y=turn_rates,
-            mode="lines",
-            name="Dynamic Vyse Curve",
-            line=dict(color="deepskyblue", width=2, dash="dot"),
-            hoverinfo="skip",
-            showlegend=True
-        ))
+        # ✅ Clip to envelope - must be within lift limit (stall boundary)
+        vyse_curve_arr = np.array(vyse_curve)
+        stall_tr_limit = np.interp(vyse_curve_arr, stall_clipped_x, stall_clipped_y)
 
+        valid_mask = (turn_rates_full >= y_min) & (turn_rates_full <= y_max) & (turn_rates_full <= stall_tr_limit)
+        bank_angles_masked = bank_angles[valid_mask]
+        vyse_display_curve = vyse_display_curve_full[valid_mask]
+        turn_rates = turn_rates_full[valid_mask]
+
+        # Build hover text
+        vyse_hover = [
+            f"<b>DVyse</b><br>Bank: {bank:.0f}°<br>Vyse: {spd:.0f} {unit}<br>Turn Rate: {tr:.1f}°/s"
+            for bank, spd, tr in zip(bank_angles_masked, vyse_display_curve, turn_rates)
+        ]
+
+        # --- Plot DVyse line (clipped portion only)
         if len(vyse_display_curve) > 0:
-            first_vyse_display = vyse_display_curve[0]
-            first_vyse_tr = turn_rates[0]
-            x_max = max(x_max, first_vyse_display * 1.05)
-            y_max = max(y_max, first_vyse_tr * 1.05)
-
             fig.add_trace(go.Scatter(
-                x=[first_vyse_display],
-                y=[first_vyse_tr],
-                mode="markers",
-                marker=dict(color="deepskyblue", size=8, symbol="circle"),
-                name="Dynamic Vyse",
-                showlegend=False,
-                hoverinfo="skip"
+                x=vyse_display_curve,
+                y=turn_rates,
+                mode="lines",
+                name="DVyse",
+                line=dict(color="#00BFFF", width=2.5, dash="dot"),
+                hoverinfo="text",
+                hovertext=vyse_hover,
+                showlegend=True
             ))
 
-            fig.add_annotation(
-                x=first_vyse_display + 2,
-                y=first_vyse_tr,
-                text=f"DVyse: {first_vyse_display:.0f} {unit}",
-                showarrow=True,
-                arrowhead=2,
-                ax=40,
-                ay=-20,
-                font=dict(size=10, color="deepskyblue"),
-                bgcolor="rgba(255,255,255,0.8)",
-                borderpad=3
-            )    
+            x_max = max(x_max, vyse_display_curve[0] * 1.05)
+            y_max = max(y_max, turn_rates[0] * 1.05)
 
-    # --- Published Vyse Line ---
-        # Published Vyse (Clipped)
+        # Always show DVyse label at calculated value (even if clipped)
+        fig.add_annotation(
+            x=dvyse_label_value,
+            y=min(dvyse_label_tr, y_max * 0.90),
+            text=f"<b>DVyse</b> {dvyse_label_value:.0f}",
+            showarrow=True,
+            arrowhead=2,
+            ax=-45,
+            ay=15,
+            font=dict(size=10, color="#00BFFF"),
+            bgcolor="rgba(255,255,255,0.9)",
+            borderpad=3
+        )    
+
+    # --- Published Vyse Line (Static Reference) ---
         if oei_active and published_vyse:
             vyse_display = convert_display_airspeed(published_vyse, unit)
-
             vyse_y_top = np.interp(published_vyse, g_clipped_x, g_clipped_y) if g_clipped_x else 0
-            vyse_y_bot = np.interp(published_vyse, neg_g_x_clip, neg_g_y_clip) if "negative_g" in overlay_toggle and 'neg_g_x_clip' in locals() else 0
 
             fig.add_trace(go.Scatter(
                 x=[vyse_display, vyse_display],
                 y=[0, vyse_y_top],
                 mode="lines",
-                name=f"Vyse ({vyse_display:.0f} {unit})",
-                line=dict(color="#00BFFF", width=2, dash="dashdot"),
-                hoverinfo="skip"
+                name="Vyse",
+                line=dict(color="#87CEEB", width=2, dash="dashdot"),
+                hoverinfo="text",
+                hovertext=f"<b>Vyse</b><br>{vyse_display:.0f} {unit}<br>(Best rate SE climb)"
             ))
 
+            # Annotation offset to the right to avoid overlap
             fig.add_annotation(
                 x=vyse_display,
-                y=y_max * 0.95,
-                text="Vyse",
-                showarrow=False,
-                font=dict(size=10, color="#00BFFF"),
-                bgcolor="rgba(255,255,255,0.8)",
-                xanchor="center"
+                y=vyse_y_top,
+                text=f"<b>Vyse</b> {vyse_display:.0f}",
+                showarrow=True,
+                arrowhead=2,
+                ax=35,
+                ay=-15,
+                font=dict(size=9, color="#87CEEB"),
+                bgcolor="rgba(255,255,255,0.9)",
+                borderpad=2
             )
 
-    # --- Published Vxse Line ---
-    # Published Vxse (Clipped)
+    # --- Published Vxse Line (Static Reference) ---
         vxse_block = ac.get("single_engine_limits", {}).get("Vxse", {})
         if isinstance(vxse_block, dict):
             published_vxse = vxse_block.get("clean_up") or next(iter(vxse_block.values()), None)
@@ -2323,78 +2662,107 @@ def update_graph(
             published_vxse = vxse_block if isinstance(vxse_block, (int, float)) else None
         if oei_active and published_vxse:
             vxse_display = convert_display_airspeed(published_vxse, unit)
-
             vxse_y_top = np.interp(published_vxse, g_clipped_x, g_clipped_y) if g_clipped_x else 0
-            vxse_y_bot = np.interp(published_vxse, neg_g_x_clip, neg_g_y_clip) if "negative_g" in overlay_toggle and 'neg_g_x_clip' in locals() else 0
 
             fig.add_trace(go.Scatter(
                 x=[vxse_display, vxse_display],
                 y=[0, vxse_y_top],
                 mode="lines",
-                name=f"Vxse ({vxse_display:.0f} {unit})",
+                name="Vxse",
                 line=dict(color="#00CC66", width=2, dash="dash"),
-                hoverinfo="skip"
+                hoverinfo="text",
+                hovertext=f"<b>Vxse</b><br>{vxse_display:.0f} {unit}<br>(Best angle SE climb)"
             ))
 
+            # Annotation offset to the left to avoid overlap
             fig.add_annotation(
                 x=vxse_display,
-                y=y_max * 0.90,
-                text="Vxse",
-                showarrow=False,
-                font=dict(size=10, color="#00CC66"),
-                bgcolor="rgba(255,255,255,0.8)",
-                xanchor="center"
+                y=vxse_y_top,
+                text=f"<b>Vxse</b> {vxse_display:.0f}",
+                showarrow=True,
+                arrowhead=2,
+                ax=-35,
+                ay=-15,
+                font=dict(size=9, color="#00CC66"),
+                bgcolor="rgba(255,255,255,0.9)",
+                borderpad=2
             )
         
-    # --- Dynamic Hover Template ---
-    hover_ias = []
-    hover_tr = []
-    hover_aob = []
+    # --- Enhanced Hover Grid (Always Present) ---
+    # Generate hover data grid covering the flight envelope
+    hover_ias_step = 5  # IAS increment for hover grid
+    hover_tr_step = 2   # Turn rate increment for hover grid
 
-    # Only build hover data if Ps grid exists / Ps overlay is enabled
-    if (
-        "ps" in overlay_toggle
-        and Ps_masked is not None
-        and tr_vals_ps is not None
-        and ias_vals_ps_internal is not None
-    ):
-        rows, cols = Ps_masked.shape
-        for i in range(rows):
-            for j in range(cols):
-                if not np.isnan(Ps_masked[i, j]):
-                    ias = ias_vals_ps_internal[j]   # use internal value
-                    tr = tr_vals_ps[i]
-                    v_fts = ias * 1.68781
-                    omega_rad = tr * (np.pi / 180)
-                    aob_deg = np.degrees(np.arctan(omega_rad * v_fts / g))
+    # Create grid spanning the envelope
+    hover_ias_range = np.arange(ias_start, max_speed_internal + 1, hover_ias_step)
+    hover_tr_range = np.arange(0, 50, hover_tr_step)  # Positive turn rates
 
-                    display_ias = convert_display_airspeed(ias, unit)  # convert only for x-axis display
-                    hover_ias.append(display_ias)
-                    hover_tr.append(tr)
-                    hover_aob.append(aob_deg)
+    hover_ias_list = []
+    hover_tr_list = []
+    hover_data = []  # Will hold [AOB, G, Ps, Radius] for each point
 
-    # Determine hover template
-    if "aob" in overlay_toggle:
-        hovertemplate=f"IAS: %{{x:.0f}} {unit}<br>Turn Rate: %{{y:.0f}}°/s<br>AOB: %{{customdata:.0f}}°<extra></extra>"
-        
-        
+    for ias in hover_ias_range:
+        for tr in hover_tr_range:
+            v_fps = ias * KTS_TO_FPS
+            omega_rad = tr * (np.pi / 180)
+
+            # Calculate AOB from turn rate
+            aob_deg = np.degrees(np.arctan(omega_rad * v_fps / g))
+
+            # Calculate load factor (G)
+            n = np.sqrt(1 + (v_fps * omega_rad / g) ** 2)
+
+            # Calculate turn radius (ft -> nm for display)
+            if omega_rad > 0.001:
+                radius_ft = (v_fps ** 2) / (g * np.tan(np.radians(aob_deg))) if aob_deg > 0.5 else float('inf')
+                radius_nm = radius_ft / 6076.12 if radius_ft < 1e6 else float('inf')
+            else:
+                radius_ft = float('inf')
+                radius_nm = float('inf')
+
+            # Calculate Ps at this point
+            q = 0.5 * rho * v_fps ** 2
+            CL_hover = weight * n / (q * wing_area) if q > 0 else 0
+            CL_hover = min(CL_hover, cl_max)
+            CD_hover = (CD0 + (CL_hover ** 2) / (np.pi * e * AR)) * cg_drag_factor * gear_drag_factor
+            D_hover = q * wing_area * CD_hover
+
+            V_max_kts = ac.get("prop_thrust_decay", {}).get("V_max_kts", 160)
+            T_static = ac.get("prop_thrust_decay", {}).get("T_static_factor", 2.6) * hp
+            V_fraction = np.clip(ias / V_max_kts, 0, 1)
+            T_hover = T_static * (1 - V_fraction ** 2)
+
+            Ps_hover = ((T_hover - D_hover) * v_fps / weight) * FPS_TO_KTS
+
+            # Check if point is within envelope (above stall, below G limit)
+            stall_n = (0.5 * rho * v_fps**2 * wing_area * cl_max) / weight
+            n_limit = g_limit
+
+            if n <= min(stall_n, n_limit) and n >= 1.0 and ias <= max_speed_internal:
+                display_ias = convert_display_airspeed(ias, unit)
+                hover_ias_list.append(display_ias)
+                hover_tr_list.append(tr)
+                hover_data.append([aob_deg, n, Ps_hover, radius_nm])
+
+    # Add hover trace with enhanced tooltip
+    if hover_ias_list:
+        hover_customdata = np.array(hover_data)
+
         fig.add_trace(go.Scatter(
-            x=hover_ias,
-            y=hover_tr,
-            customdata=np.array(hover_aob),
+            x=hover_ias_list,
+            y=hover_tr_list,
+            customdata=hover_customdata,
             mode="markers",
-            marker=dict(size=6, color="rgba(0,0,0,0)"),
-            hovertemplate=hovertemplate,
-            name="",
-            showlegend=False
-        ))
-    else:
-        fig.add_trace(go.Scatter(
-            x=hover_ias,
-            y=hover_tr,
-            mode="markers",
-            marker=dict(size=6, color="rgba(0,0,0,0)"),
-            hovertemplate=f"IAS: %{{x:.0f}} {unit}<br>Turn Rate: %{{y:.0f}}°/s<extra></extra>",
+            marker=dict(size=8, color="rgba(0,0,0,0)"),
+            hovertemplate=(
+                f"<b>IAS:</b> %{{x:.0f}} {unit}<br>"
+                f"<b>Turn Rate:</b> %{{y:.1f}}°/s<br>"
+                f"<b>Bank:</b> %{{customdata[0]:.0f}}°<br>"
+                f"<b>Load Factor:</b> %{{customdata[1]:.2f}} G<br>"
+                f"<b>Ps:</b> %{{customdata[2]:.1f}} kts/s<br>"
+                f"<b>Turn Radius:</b> %{{customdata[3]:.2f}} nm"
+                f"<extra></extra>"
+            ),
             name="",
             showlegend=False
         ))
@@ -2481,23 +2849,27 @@ def update_graph(
 
             if isinstance(vmca_value, (int, float)):
                 vmca_converted = convert_display_airspeed(vmca_value, unit)
+                # Clip to envelope top
+                vmca_y_top = np.interp(vmca_value, g_clipped_x, g_clipped_y) if g_clipped_x else y_max
 
                 fig.add_trace(go.Scatter(
                     x=[vmca_converted, vmca_converted],
-                    y=[0, y_max],
+                    y=[0, vmca_y_top],
                     mode="lines",
-                    name=f"Vmca ({int(vmca_converted)} {unit})",
-                    line=dict(color="red", width=2, dash="dash"),
-                    hoverinfo="skip"
+                    name="Published Vmca",
+                    line=dict(color="#FF6B6B", width=2, dash="dash"),
+                    hoverinfo="text",
+                    hovertext=f"<b>Published Vmca</b><br>{vmca_converted:.0f} {unit}<br>(Minimum controllable airspeed)"
                 ))
 
                 fig.add_annotation(
                     x=vmca_converted,
-                    y=y_max * 0.90,
-                    text="Vmca",
+                    y=vmca_y_top,
+                    text=f"<b>Vmca</b> {vmca_converted:.0f}",
                     showarrow=False,
-                    font=dict(size=10, color="red"),
-                    bgcolor="rgba(255,255,255,0.8)",
+                    yshift=12,
+                    font=dict(size=9, color="#FF6B6B"),
+                    bgcolor="rgba(255,255,255,0.9)",
                     xanchor="center"
                 )
  
@@ -2583,15 +2955,21 @@ def update_graph(
         aob_input = aob_values[0]
         ias_input = ias_values[0]
 
-        v_fts = ias_input * 1.68781
+        # Guard against None values
+        if ias_input is None or aob_input is None:
+            ias_input = 110  # default
+            aob_input = 45   # default
+
+        v_fts = ias_input * KTS_TO_FPS
         bank_rad = np.radians(aob_input)
-        tr_deg = np.degrees(32.174 * np.tan(bank_rad) / v_fts)
+        tr_deg = np.degrees(G_FT_S2 * np.tan(bank_rad) / v_fts)
 
         # --- Energy Rate (Ps) at this point ---
         n = 1 / np.cos(bank_rad)  # load factor for level constant altitude turn
         q = 0.5 * rho * v_fts ** 2
         CL = weight * n / (q * wing_area)
-        CD = CD0 + (CL ** 2) / (np.pi * e * AR)
+        CL = min(CL, cl_max)  # Clip to CL_max like Ps grid does
+        CD = (CD0 + (CL ** 2) / (np.pi * e * AR)) * cg_drag_factor * gear_drag_factor
         D = q * wing_area * CD
 
         # Apply prop thrust model (same as Ps logic)
@@ -2601,51 +2979,90 @@ def update_graph(
         T_avail = T_static * (1 - V_fraction**2)
 
         gamma_rad = np.radians(pitch_angle)
-        Ps_steep = ((T_avail - D) * v_fts / weight - g * np.sin(gamma_rad)) / 1.68781
+        Ps_steep = ((T_avail - D) * v_fts / weight - v_fts * np.sin(gamma_rad)) * FPS_TO_KTS
 
         dprint("[STEEP TURN DEBUG]")
         dprint(f"  IAS: {ias_input} KIAS, AOB: {aob_input}°")
         dprint(f"  Turn Rate: {tr_deg:.1f}°/s")
         dprint(f"  Ps: {Ps_steep:.2f} knots/sec")
 
-        arc_tr = [0.0, tr_deg, tr_deg, 0.0, 0.0]
-        arc_ias = [ias_input] * len(arc_tr)
-        arc_ias_display = [ias * 1.15078 if unit == "MPH" else ias for ias in arc_ias]
+        # Simplified steep turn trace: vertical line from 0 to operating point
+        arc_tr = [0.0, tr_deg]
+        arc_ias = [ias_input, ias_input]
+        arc_ias_display = [ias * KTS_TO_MPH if unit == "MPH" else ias for ias in arc_ias]
+
+        # Contextual hover text for each point
+        steep_hover = [
+            f"<b>Roll In (Wings Level)</b><br>AOB: 0°<br>IAS: {arc_ias_display[0]:.0f} {unit}<br>Turn Rate: 0°/s<br>G: 1.00",
+            f"<b>Operating Point</b><br>AOB: {aob_input}°<br>IAS: {arc_ias_display[1]:.0f} {unit}<br>Turn Rate: {tr_deg:.1f}°/s<br>G: {n:.2f}<br>Ps: {Ps_steep:.1f} kts/s"
+        ]
 
         fig.add_trace(go.Scatter(
             x=arc_ias_display,
             y=arc_tr,
             mode="lines+markers",
             line=dict(color="darkgreen", width=3),
-            marker=dict(size=6),
+            marker=dict(size=8, symbol=["circle", "diamond"]),
             name="Steep Turn",
             hoverinfo="text",
-            hovertext=[
-                f"AOB: {aob_input}°<br>IAS: {ias_input} {unit}<br>Turn Rate: {tr:.1f}°/s<br>Ps: {Ps_steep:.1f}"
-                for tr in arc_tr
-            ],
+            hovertext=steep_hover,
             showlegend=True
         ))
+
+        # Annotation at operating point showing key values
+        fig.add_annotation(
+            x=arc_ias_display[1],
+            y=tr_deg,
+            text=f"<b>{aob_input}° AOB</b><br>{n:.1f}G | Ps: {Ps_steep:.1f}",
+            showarrow=True,
+            arrowhead=2,
+            ax=50,
+            ay=-25,
+            font=dict(size=10, color="darkgreen"),
+            bgcolor="rgba(255,255,255,0.85)",
+            borderpad=3
+        )
+
+        # Annotation at wings level
+        fig.add_annotation(
+            x=arc_ias_display[0],
+            y=0,
+            text="Wings Level",
+            showarrow=False,
+            yshift=-15,
+            font=dict(size=9, color="darkgreen"),
+            bgcolor="rgba(255,255,255,0.7)",
+            borderpad=2
+        )
     #------Ghost Trace------#
-# === GHOST TRACE (Ideal AOB)
-    if ghost_mode_values and ghost_mode_values[0] != "off":
-        ghost_aob = 45 if ghost_mode_values[0] == "private" else 50
+# === GHOST TRACE (Ideal AOB based on ACS Standard)
+    # Check if ghost trace is enabled and a standard is selected
+    # Handle both boolean (from Switch) and list (from Checklist)
+    ghost_val = steepturn_ghost_values[0] if steepturn_ghost_values else False
+    ghost_enabled = ghost_val is True or (isinstance(ghost_val, list) and "on" in ghost_val)
+    standard_selected = steepturn_standard_values and len(steepturn_standard_values[0]) > 0
+
+    if ghost_enabled and standard_selected:
+        # Determine AOB based on selected standard(s) - use first selection
+        selected_standard = steepturn_standard_values[0][0]  # "private" or "commercial"
+        ghost_aob = 45 if selected_standard == "private" else 50
         ghost_ias = ias_values[0] if ias_values else 110  # fallback if none provided
 
-        v_fts = ghost_ias * 1.68781
+        v_fts = ghost_ias * KTS_TO_FPS
         bank_rad = np.radians(ghost_aob)
-        ghost_tr = np.degrees(32.174 * np.tan(bank_rad) / v_fts)
+        ghost_tr = np.degrees(G_FT_S2 * np.tan(bank_rad) / v_fts)
 
         ghost_tr_array = [0.0, ghost_tr, ghost_tr, 0.0, 0.0]
         ghost_ias_array = [ghost_ias] * len(ghost_tr_array)
-        ghost_ias_display = [ias * 1.15078 if unit == "MPH" else ias for ias in ghost_ias_array]
+        ghost_ias_display = [ias * KTS_TO_MPH if unit == "MPH" else ias for ias in ghost_ias_array]
 
+        standard_label = "Private" if selected_standard == "private" else "Commercial"
         fig.add_trace(go.Scatter(
             x=ghost_ias_display,
             y=ghost_tr_array,
             mode="lines",
             line=dict(color="white", width=2, dash="dot"),
-            name=f"Ideal ({ghost_aob}°)",
+            name=f"{standard_label} ({ghost_aob}°)",
             hoverinfo="skip",
             showlegend=True
         ))
@@ -2668,14 +3085,14 @@ def update_graph(
         unit,
         color="darkgreen",
         dash="solid",
-        label="Chandelle"
+        label="Chandelle",
+        show_annotations=True
     ):
         from plotly.graph_objects import Scatter
-        from math import radians, tan, degrees
+        from math import radians, tan, degrees, cos
 
-        g = 32.174
-        v_start = chandelle_ias_start * 1.68781  # ft/s
-        v_end = (stall_ias_kias + 5) * 1.68781   # ft/s
+        v_start = chandelle_ias_start * KTS_TO_FPS  # ft/s
+        v_end = (stall_ias_kias + 5) * KTS_TO_FPS   # ft/s
         delta_v = v_start - v_end
 
         # Airspeed lost more aggressively with higher AOB
@@ -2690,6 +3107,8 @@ def update_graph(
 
         airspeeds = []
         turn_rates = []
+        aob_list = []
+        heading_list = []
 
         while angle < max_turn_deg and steps < max_steps:
             if angle <= 90:
@@ -2703,11 +3122,13 @@ def update_graph(
 
             v = max(v, v_end)  # Never dip below final airspeed
             aob_rad = radians(aob_deg)
-            omega_rad = g * tan(aob_rad) / v
+            omega_rad = G_FT_S2 * tan(aob_rad) / v
             tr = degrees(omega_rad)
 
-            airspeeds.append(v / 1.68781)
+            airspeeds.append(v * FPS_TO_KTS)
             turn_rates.append(tr)
+            aob_list.append(aob_deg)
+            heading_list.append(angle)
 
             angle += tr * dt
             steps += 1
@@ -2716,21 +3137,74 @@ def update_graph(
             dprint("[WARN] No chandelle points generated.")
             return fig
 
-        airspeeds_display = [ias * 1.15078 if unit == "MPH" else ias for ias in airspeeds]
+        airspeeds_display = [ias * KTS_TO_MPH if unit == "MPH" else ias for ias in airspeeds]
+
+        # Build contextual hover text with G load factor and heading progress
+        hover_texts = []
+        for i, (ias, tr, aob, hdg) in enumerate(zip(airspeeds_display, turn_rates, aob_list, heading_list)):
+            g_load = 1 / cos(radians(aob)) if aob > 0 else 1.0
+            if i == 0:
+                phase = "<b>START</b>"
+            elif hdg >= 175:
+                phase = "<b>END</b>"
+            elif hdg < 90:
+                phase = f"First Half ({hdg:.0f}°)"
+            else:
+                phase = f"Second Half ({hdg:.0f}°)"
+            hover_texts.append(
+                f"{phase}<br>IAS: {ias:.0f} {unit}<br>Turn Rate: {tr:.1f}°/s<br>AOB: {aob:.0f}°<br>G: {g_load:.2f}<br>Heading: {hdg:.0f}°"
+            )
 
         fig.add_trace(Scatter(
             x=airspeeds_display,
             y=turn_rates,
             mode="lines+markers",
             line=dict(color=color, width=3, dash=dash),
-            marker=dict(size=6),
+            marker=dict(size=4),
             name=label,
             hoverinfo="text",
-            hovertext=[
-                f"IAS: {ias:.1f} {unit}<br>Turn Rate: {tr:.1f}°/s<br>AOB: {aob:.1f}°"
-                for ias, tr, aob in zip(airspeeds_display, turn_rates, [chandelle_bank if angle <= 90 else max(0, chandelle_bank - ((angle - 90) / 3)) for angle in np.linspace(0, 180, len(turn_rates))])
-            ]
+            hovertext=hover_texts
         ))
+
+        # Add START and END annotations (only for main trace, not ghost)
+        if show_annotations and len(airspeeds_display) > 1:
+            # START annotation (right side - high airspeed)
+            fig.add_annotation(
+                x=airspeeds_display[0],
+                y=turn_rates[0],
+                text="<b>START</b>",
+                showarrow=True,
+                arrowhead=2,
+                ax=30,
+                ay=-20,
+                font=dict(size=10, color=color),
+                bgcolor="rgba(255,255,255,0.85)",
+                borderpad=2
+            )
+            # END annotation (left side - low airspeed)
+            fig.add_annotation(
+                x=airspeeds_display[-1],
+                y=turn_rates[-1],
+                text="<b>END</b>",
+                showarrow=True,
+                arrowhead=2,
+                ax=-30,
+                ay=-20,
+                font=dict(size=10, color=color),
+                bgcolor="rgba(255,255,255,0.85)",
+                borderpad=2
+            )
+            # Direction indicator in middle
+            mid_idx = len(airspeeds_display) // 2
+            fig.add_annotation(
+                x=airspeeds_display[mid_idx],
+                y=turn_rates[mid_idx] + 1.5,
+                text="← Energy Flow →",
+                showarrow=False,
+                font=dict(size=9, color="gray"),
+                bgcolor="rgba(255,255,255,0.7)",
+                borderpad=2
+            )
 
         return fig
 
@@ -2738,7 +3212,7 @@ def update_graph(
         chandelle_ias = chandelle_ias_values[0]
         chandelle_bank = chandelle_bank_values[0]
         # Compute dynamic stall speed at 1G level turn
-        v_stall_1g = np.sqrt((2 * weight) / (rho * wing_area * cl_max)) / 1.68781
+        v_stall_1g = np.sqrt((2 * weight) / (rho * wing_area * cl_max)) * FPS_TO_KTS
         stall_ias_kias = v_stall_1g
 
         fig = plot_chandelle(
@@ -2752,7 +3226,10 @@ def update_graph(
             label="Chandelle"
         )
 
-        if chandelle_ghost_values and chandelle_ghost_values[0] == "on":
+        # Handle both boolean (from Switch) and list (from Checklist)
+        chandelle_ghost_val = chandelle_ghost_values[0] if chandelle_ghost_values else False
+        chandelle_ghost_on = chandelle_ghost_val is True or (isinstance(chandelle_ghost_val, list) and "on" in chandelle_ghost_val)
+        if chandelle_ghost_on:
             fig = plot_chandelle(
                 fig,
                 chandelle_ias_start=chandelle_ias,
@@ -2761,19 +3238,10 @@ def update_graph(
                 unit=unit,
                 color="white",
                 dash="dot",
-                label="Chandelle Ghost"
+                label="Chandelle Ghost",
+                show_annotations=False
             )
 
-    fig.add_annotation(
-        text="© 2025 Nicholas Len, AEROEDGE. All rights reserved.<br>Not FAA-approved. For educational and reference use only.",
-        xref="paper", yref="paper",
-        x=0.5, y=-0.15,
-        xanchor="center", yanchor="top",
-        showarrow=False,
-        font=dict(size=9, color="gray"),
-        align="center",
-        name="png-only-disclaimer"
-    )
     t_end = time.perf_counter()
     dprint(f"[PERF] update_graph total: {(t_end - t_start):.3f} sec")
     
@@ -2792,52 +3260,86 @@ import re
 def render_maneuver_options(maneuver):
     if maneuver == "steep_turn":
         return html.Div([
-            html.Div([
-                html.Label("Angle of Bank (°)", style={"marginLeft": "10px"}),
-                dcc.Slider(
-                    id={"type": "steepturn-aob", "index": 0},
-                    min=10,
-                    max=90,
-                    step=5,
-                    value=45,
-                    marks={i: f"{i}°" for i in range(10, 91, 10)},
-                    tooltip={"always_visible": True},
-                    included=False,
-                )
-            ], style={"display": "inline-block", "width": "300px", "marginRight": "30px"}),
+            # Row 1: Airspeed input
+            dbc.Row([
+                dbc.Col([
+                    html.Label("Airspeed (KIAS)", className="input-label-sm"),
+                    dcc.Input(
+                        id={"type": "steepturn-ias", "index": 0},
+                        type="number",
+                        value=110,
+                        min=40,
+                        max=200,
+                        step=1,
+                        style={"width": "100px"}
+                    )
+                ], width="auto")
+            ], className="mb-3"),
 
-            html.Div([
-                html.Label("Ghost Trace"),
-                dcc.RadioItems(
-                    id={"type": "steepturn-ghost", "index": 0},
-                    options=[
-                        {"label": "Off", "value": "off"},
-                        {"label": "Private (45°)", "value": "private"},
-                        {"label": "Commercial (50°)", "value": "commercial"},
-                    ],
-                    value="off",
-                    labelStyle={"display": "inline-block", "marginRight": "15px"}
-                )
-            ], style={"display": "inline-block", "verticalAlign": "top"}),
+            # Row 2: AOB Slider
+            dbc.Row([
+                dbc.Col([
+                    html.Label("Angle of Bank (°)", className="input-label-sm"),
+                    dcc.Slider(
+                        id={"type": "steepturn-aob", "index": 0},
+                        min=10,
+                        max=90,
+                        step=5,
+                        value=45,
+                        marks={i: f"{i}°" for i in range(10, 91, 10)},
+                        tooltip={"always_visible": True},
+                        included=False,
+                    )
+                ])
+            ], className="mb-3"),
 
-            html.Div([
-                html.Label("Airspeed (KIAS)", style={"marginLeft": "10px"}),
-                dcc.Input(
-                    id={"type": "steepturn-ias", "index": 0},
-                    type="number",
-                    value=110,
-                    min=40,
-                    max=200,
-                    step=1,
-                    style={"width": "80px", "marginLeft": "10px"}
-                )
-            ], style={"marginTop": "10px"})
+            # Row 3: Ghost Trace Toggle
+            dbc.Row([
+                dbc.Col([
+                    html.Div([
+                        html.Div([
+                            html.Span("Ghost Trace", className="overlay-label"),
+                            html.Span("?", id={"type": "ghost-help-trigger", "index": "steep"}, className="help-icon", n_clicks=0)
+                        ], className="label-group"),
+                        dbc.Switch(
+                            id={"type": "steepturn-ghost", "index": 0},
+                            value=False,
+                            className="form-switch"
+                        )
+                    ], className="overlay-row")
+                ])
+            ], className="mb-2"),
+
+            # Row 4: ACS Standard Selection (only visible when ghost trace is on)
+            html.Div(
+                id="acs-standard-container",
+                children=[
+                    dbc.Row([
+                        dbc.Col([
+                            html.Label("ACS Standard", className="input-label-sm", style={"marginLeft": "20px"}),
+                            dbc.Checklist(
+                                id={"type": "steepturn-standard", "index": 0},
+                                options=[
+                                    {"label": "Private (45°)", "value": "private"},
+                                    {"label": "Commercial (50°)", "value": "commercial"},
+                                ],
+                                value=[],
+                                switch=True,
+                                className="switch-list",
+                                style={"marginLeft": "20px"}
+                            )
+                        ])
+                    ])
+                ],
+                style={"display": "none"}  # Hidden by default
+            )
         ])
     elif maneuver == "chandelle":
         return html.Div([
+            # Row 1: Airspeed input
             dbc.Row([
                 dbc.Col([
-                    html.Label("Initial Airspeed (KIAS)", className="input-label"),
+                    html.Label("Airspeed (KIAS)", className="input-label-sm"),
                     dcc.Input(
                         id={"type": "chandelle-ias", "index": 0},
                         type="number",
@@ -2850,9 +3352,10 @@ def render_maneuver_options(maneuver):
                 ], width="auto")
             ], className="mb-3"),
 
+            # Row 2: AOB Slider
             dbc.Row([
                 dbc.Col([
-                    html.Label("Initial Bank (°)", className="input-label"),
+                    html.Label("Angle of Bank (°)", className="input-label-sm"),
                     dcc.Slider(
                         id={"type": "chandelle-bank", "index": 0},
                         min=10,
@@ -2866,22 +3369,53 @@ def render_maneuver_options(maneuver):
                 ])
             ], className="mb-3"),
 
+            # Row 3: Ghost Trace Toggle
             dbc.Row([
                 dbc.Col([
-                    html.Label("Show Ghost Trace", className="input-label"),
-                    dcc.RadioItems(
-                        id={"type": "chandelle-ghost", "index": 0},
-                        options=[
-                            {"label": "Off", "value": "off"},
-                            {"label": "On", "value": "on"}
-                        ],
-                        value="on",
-                        inline=True,
-                        labelStyle={"marginRight": "15px"}
-                    )
+                    html.Div([
+                        html.Div([
+                            html.Span("Ghost Trace", className="overlay-label"),
+                            html.Span("?", id={"type": "ghost-help-trigger", "index": "chandelle"}, className="help-icon", n_clicks=0)
+                        ], className="label-group"),
+                        dbc.Switch(
+                            id={"type": "chandelle-ghost", "index": 0},
+                            value=True,
+                            className="form-switch"
+                        )
+                    ], className="overlay-row")
                 ])
             ])
         ])
+
+    # No maneuver selected
+    return None
+
+# Callback to enforce mutual exclusivity on ACS Standard toggles
+@app.callback(
+    Output({"type": "steepturn-standard", "index": 0}, "value"),
+    Input({"type": "steepturn-standard", "index": 0}, "value"),
+    prevent_initial_call=True
+)
+def enforce_single_standard(current_value):
+    """Only allow one ACS standard to be selected at a time."""
+    if not current_value or len(current_value) <= 1:
+        return current_value
+    # If multiple selected, keep only the most recently added (last in list)
+    return [current_value[-1]]
+
+# Callback to show/hide ACS Standard options based on Ghost Trace toggle
+@app.callback(
+    Output("acs-standard-container", "style"),
+    Input({"type": "steepturn-ghost", "index": 0}, "value"),
+    prevent_initial_call=True
+)
+def toggle_acs_standard_visibility(ghost_value):
+    """Show ACS Standard options only when Ghost Trace is enabled."""
+    # Handle both boolean (from Switch) and list (from Checklist)
+    if ghost_value is True or (isinstance(ghost_value, list) and "on" in ghost_value):
+        return {"display": "block"}
+    return {"display": "none"}
+
 
 def get_summary_text(ac_name, engine_name, config, gear, occupants, fuel, total_weight, power_fraction, altitude):
     return (
@@ -2916,16 +3450,25 @@ def get_summary_text(ac_name, engine_name, config, gear, occupants, fuel, total_
     State("altitude-slider", "value"),
     State("pitch-angle", "value"),
     State("oei-toggle", "value"),
-    State("prop-condition", "value"),
+    State("prop-condition", "data"),
     State("maneuver-select", "value"),
+    State("oat-input", "value"),
+    State("unit-select", "data"),
+    State("cg-slider", "value"),
+    State("overlay-toggle", "data"),
     prevent_initial_call=True
 )
 def generate_pdf(n_clicks, fig_data, ac_name, engine_name, config, gear, occupants, pax_weight, fuel, total_weight,
-                 power_fraction, altitude, pitch, oei_toggle, prop_condition, maneuver):
+                 power_fraction, altitude, pitch, oei_toggle, prop_condition, maneuver,
+                 oat_c, speed_unit, cg_position, active_overlays):
     if ctx.triggered_id != "pdf-button":
         return dash.no_update
 
     fig = go.Figure(fig_data)
+
+    # Generate timestamp
+    from datetime import datetime
+    export_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     
 
 
@@ -2950,15 +3493,39 @@ def generate_pdf(n_clicks, fig_data, ac_name, engine_name, config, gear, occupan
 
     # ✅ Summary Text
     oei_status = "YES" if oei_toggle and "enabled" in oei_toggle else "NO"
-    maneuver_text = f"Maneuver: {maneuver}" if maneuver else ""
+
+    # Convert OAT to Fahrenheit for display
+    oat_f = round(oat_c * 9/5 + 32) if oat_c is not None else "N/A"
+    oat_display = f"{oat_c}°C / {oat_f}°F" if oat_c is not None else "N/A"
+
+    # Calculate CG in inches from slider position and aircraft CG range
+    cg_display = "N/A"
+    if cg_position is not None and ac_name and ac_name in aircraft_data:
+        ac = aircraft_data[ac_name]
+        cg_range = ac.get("cg_range", [0, 100])
+        cg_inches = cg_range[0] + cg_position * (cg_range[1] - cg_range[0])
+        cg_display = f"{cg_inches:.1f} in"
+
+    # Format active overlays
+    overlay_names = {
+        "ps": "Ps Contours",
+        "radius": "Turn Radius",
+        "g": "G-Lines",
+        "aob": "AOB Shading",
+        "negative_g": "Neg-G Envelope",
+        "vmca": "Dynamic Vmc",
+        "vyse": "Dynamic Vyse"
+    }
+    active_overlay_list = [overlay_names.get(o, o) for o in (active_overlays or [])]
+    overlays_display = ", ".join(active_overlay_list) if active_overlay_list else "None"
 
     summary_lines = [
-        f"Engine: {engine_name} | Category: {config} | Gear: {gear}",
-        f"Occupants: {occupants} x {pax_weight or 180} lbs | Fuel: {fuel} gal",
-        f"Power: {int(power_fraction * 100)}% | Altitude: {altitude} ft | Pitch: {pitch}°",
-        f"Total Weight: {int(total_weight)} lbs | OEI: {oei_status}",
-        f"Prop Condition: {prop_condition if oei_status == 'YES' else 'N/A'}",
-        maneuver_text
+        f"Engine: {engine_name} | {config} | Gear: {gear}",
+        f"Weight: {int(total_weight) if total_weight else 'N/A'} lbs | Occupants: {occupants} x {pax_weight or 180} lbs | Fuel: {fuel} gal | CG: {cg_display}",
+        f"Altitude: {altitude or 0} ft | OAT: {oat_display} | Power: {int(power_fraction * 100)}%",
+        f"Speed Unit: {speed_unit or 'KIAS'} | OEI: {oei_status}" + (f" ({prop_condition})" if oei_status == "YES" else ""),
+        f"Overlays: {overlays_display}" + (f" | Maneuver: {maneuver}" if maneuver else ""),
+        f"<i>Generated: {export_timestamp}</i>"
     ]
 
     fig.add_annotation(
@@ -2971,24 +3538,150 @@ def generate_pdf(n_clicks, fig_data, ac_name, engine_name, config, gear, occupan
         align="center"
     )
 
-    # ✅ Footer
+    # ✅ Footer for exports
     fig.add_annotation(
-        text="© 2025 Nicholas Len, AEROEDGE. All rights reserved.<br>Not FAA-approved. For educational and reference use only.",
+        text="© 2025 Nicholas Len, AEROEDGE. All rights reserved. | Not FAA-approved. For educational and reference use only.",
         xref="paper", yref="paper",
-        x=0.5, y=-0.15,  # x=0.5 centers it; adjust y to avoid x-axis overlap
+        x=0.5, y=-0.12,
         xanchor="center", yanchor="top",
         showarrow=False,
         font=dict(size=9, color="gray"),
         align="center"
     )
-    # ✅ Clean layout margin
-    fig.update_layout(margin=dict(t=160, b=80))
+
+    # ✅ Clean layout margin (increased top margin for additional info lines)
+    fig.update_layout(margin=dict(t=180, b=80))
 
     # ✅ Save PDF to temp and return
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         pio.write_image(fig, tmp.name, format="pdf", width=1100, height=800)
         return send_file(tmp.name, filename="EMdiagram.pdf")
-    
+
+
+###----Generate PNG-----####
+
+@app.callback(
+    Output("png-download", "data"),
+    Input("png-button", "n_clicks"),
+    Input("em-graph", "figure"),
+    State("aircraft-select", "value"),
+    State("engine-select", "value"),
+    State("config-select", "value"),
+    State("gear-select", "value"),
+    State("occupants-select", "value"),
+    State("passenger-weight-input", "value"),
+    State("fuel-slider", "value"),
+    State("stored-total-weight", "data"),
+    State("power-setting", "value"),
+    State("altitude-slider", "value"),
+    State("pitch-angle", "value"),
+    State("oei-toggle", "value"),
+    State("prop-condition", "data"),
+    State("maneuver-select", "value"),
+    State("oat-input", "value"),
+    State("unit-select", "data"),
+    State("cg-slider", "value"),
+    State("overlay-toggle", "data"),
+    prevent_initial_call=True
+)
+def generate_png(n_clicks, fig_data, ac_name, engine_name, config, gear, occupants, pax_weight, fuel, total_weight,
+                 power_fraction, altitude, pitch, oei_toggle, prop_condition, maneuver,
+                 oat_c, speed_unit, cg_position, active_overlays):
+    if ctx.triggered_id != "png-button":
+        return dash.no_update
+
+    fig = go.Figure(fig_data)
+
+    # Generate timestamp
+    from datetime import datetime
+    export_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    # ✅ Add Logo (logo2.png in top-left)
+    try:
+        logo_path = os.path.join("assets", "logo2.png")
+        if os.path.exists(logo_path):
+            from PIL import Image
+            logo_img = Image.open(logo_path)
+            fig.add_layout_image(
+                dict(
+                    source=logo_img,
+                    xref="paper", yref="paper",
+                    x=-0.05, y=1.25,
+                    sizex=0.25, sizey=0.25,
+                    xanchor="left", yanchor="top",
+                    layer="above"
+                )
+            )
+    except Exception as e:
+        dprint(f"[LOGO WARNING] Failed to add logo2.png: {e}")
+
+    # ✅ Summary Text
+    oei_status = "YES" if oei_toggle and "enabled" in oei_toggle else "NO"
+
+    # Convert OAT to Fahrenheit for display
+    oat_f = round(oat_c * 9/5 + 32) if oat_c is not None else "N/A"
+    oat_display = f"{oat_c}°C / {oat_f}°F" if oat_c is not None else "N/A"
+
+    # Calculate CG in inches from slider position and aircraft CG range
+    cg_display = "N/A"
+    if cg_position is not None and ac_name and ac_name in aircraft_data:
+        ac = aircraft_data[ac_name]
+        cg_range = ac.get("cg_range", [0, 100])
+        cg_inches = cg_range[0] + cg_position * (cg_range[1] - cg_range[0])
+        cg_display = f"{cg_inches:.1f} in"
+
+    # Format active overlays
+    overlay_names = {
+        "ps": "Ps Contours",
+        "radius": "Turn Radius",
+        "g": "G-Lines",
+        "aob": "AOB Shading",
+        "negative_g": "Neg-G Envelope",
+        "vmca": "Dynamic Vmc",
+        "vyse": "Dynamic Vyse"
+    }
+    active_overlay_list = [overlay_names.get(o, o) for o in (active_overlays or [])]
+    overlays_display = ", ".join(active_overlay_list) if active_overlay_list else "None"
+
+    summary_lines = [
+        f"Engine: {engine_name} | {config} | Gear: {gear}",
+        f"Weight: {int(total_weight) if total_weight else 'N/A'} lbs | Occupants: {occupants} x {pax_weight or 180} lbs | Fuel: {fuel} gal | CG: {cg_display}",
+        f"Altitude: {altitude or 0} ft | OAT: {oat_display} | Power: {int(power_fraction * 100)}%",
+        f"Speed Unit: {speed_unit or 'KIAS'} | OEI: {oei_status}" + (f" ({prop_condition})" if oei_status == "YES" else ""),
+        f"Overlays: {overlays_display}" + (f" | Maneuver: {maneuver}" if maneuver else ""),
+        f"<i>Generated: {export_timestamp}</i>"
+    ]
+
+    fig.add_annotation(
+        text="<br>".join(summary_lines),
+        xref="paper", yref="paper",
+        x=0.5, y=1.01,
+        xanchor="center", yanchor="bottom",
+        showarrow=False,
+        font=dict(size=10, color="#1b1e23"),
+        align="center"
+    )
+
+    # ✅ Footer for exports
+    fig.add_annotation(
+        text="© 2025 Nicholas Len, AEROEDGE. All rights reserved. | Not FAA-approved. For educational and reference use only.",
+        xref="paper", yref="paper",
+        x=0.5, y=-0.12,
+        xanchor="center", yanchor="top",
+        showarrow=False,
+        font=dict(size=9, color="gray"),
+        align="center"
+    )
+
+    # ✅ Clean layout margin (increased top margin for additional info lines)
+    fig.update_layout(margin=dict(t=180, b=80))
+
+    # ✅ Save PNG to temp and return
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
+        pio.write_image(fig, tmp.name, format="png", width=1200, height=900, scale=2)
+        return send_file(tmp.name, filename="EMdiagram.png")
+
+
 # When you click "Edit / Create Aircraft"
 @app.callback(
     Output("url", "pathname"),
@@ -4083,8 +4776,8 @@ def convert_units_toggle(units,
         raise PreventUpdate
 
     # Conversion functions
-    def to_mph(val): return round(val * 1.15078, 1) if val is not None else None
-    def to_kias(val): return round(val / 1.15078, 1) if val is not None else None
+    def to_mph(val): return round(val * KTS_TO_MPH, 1) if val is not None else None
+    def to_kias(val): return round(val / KTS_TO_MPH, 1) if val is not None else None
     convert = to_mph if units == "MPH" else to_kias
 
     # Convert airspeeds
@@ -4202,7 +4895,7 @@ def save_aircraft_to_file(
 
     try:
         def convert_speed(val):
-            return round(val / 1.15078, 1) if units == "MPH" and isinstance(val, (int, float)) else val
+            return round(val / KTS_TO_MPH, 1) if units == "MPH" and isinstance(val, (int, float)) else val
 
         # --- Convert stall + SE limits ---
         converted_stalls = [
@@ -4415,30 +5108,430 @@ def load_aircraft_from_upload(contents, filename, current_data):
 @app.callback(
     Output("disclaimer-modal", "is_open"),
     Output("terms-policy-modal", "is_open"),
+    Output("readme-modal", "is_open"),
     Input("open-disclaimer", "n_clicks"),
     Input("close-disclaimer", "n_clicks"),
     Input("open-terms-policy", "n_clicks"),
     Input("close-terms-policy", "n_clicks"),
+    Input("open-readme", "n_clicks"),
+    Input("close-readme", "n_clicks"),
     State("disclaimer-modal", "is_open"),
     State("terms-policy-modal", "is_open"),
+    State("readme-modal", "is_open"),
     prevent_initial_call=True
 )
-def toggle_disclaimer_and_terms(open_disc, close_disc, open_terms, close_terms, disc_open, terms_open):
+def toggle_modals(open_disc, close_disc, open_terms, close_terms, open_readme, close_readme, disc_open, terms_open, readme_open):
+    if not ctx.triggered:
+        raise PreventUpdate
+
     ctx_id = ctx.triggered_id
 
-    if ctx_id == "open-disclaimer":
-        return True, False
-    elif ctx_id == "close-disclaimer":
-        return False, terms_open
-    elif ctx_id == "open-terms-policy":
-        return False, True
-    elif ctx_id == "close-terms-policy":
-        return disc_open, False
+    if ctx_id == "open-disclaimer" and open_disc:
+        return True, False, False
+    elif ctx_id == "close-disclaimer" and close_disc:
+        return False, terms_open, readme_open
+    elif ctx_id == "open-terms-policy" and open_terms:
+        return False, True, False
+    elif ctx_id == "close-terms-policy" and close_terms:
+        return disc_open, False, readme_open
+    elif ctx_id == "open-readme" and open_readme:
+        return False, False, True
+    elif ctx_id == "close-readme" and close_readme:
+        return disc_open, terms_open, False
 
     raise PreventUpdate
 
 
 
+
+# =============================================================================
+# MOBILE OVERLAY SYNC CALLBACK
+# =============================================================================
+
+@app.callback(
+    Output("overlay-toggle", "data", allow_duplicate=True),
+    Input("mobile-overlay-checklist", "value"),
+    prevent_initial_call=True
+)
+def sync_mobile_overlay_to_store(checklist_value):
+    """Sync mobile overlay checklist to the overlay-toggle store."""
+    return checklist_value if checklist_value is not None else []
+
+
+# =============================================================================
+# SIDEBAR COLLAPSE CALLBACKS
+# =============================================================================
+
+# Desktop sidebar collapse - use Python callback for reliability
+@app.callback(
+    [Output("sidebar-collapsed", "data"),
+     Output("sidebar-collapse-btn", "children"),
+     Output("sidebar-container", "className")],
+    Input("sidebar-collapse-btn", "n_clicks"),
+    State("sidebar-collapsed", "data"),
+    prevent_initial_call=True
+)
+def toggle_sidebar_collapse(n_clicks, is_collapsed):
+    if n_clicks:
+        new_state = not is_collapsed
+        btn_text = "»" if new_state else "«"
+        class_name = "resizable-sidebar collapsed" if new_state else "resizable-sidebar"
+        return new_state, btn_text, class_name
+    return is_collapsed, "«", "resizable-sidebar"
+
+# Mobile settings toggle
+@app.callback(
+    [Output("mobile-settings-collapse", "is_open"),
+     Output("mobile-settings-toggle", "children")],
+    Input("mobile-settings-toggle", "n_clicks"),
+    State("mobile-settings-collapse", "is_open"),
+    prevent_initial_call=True
+)
+def toggle_mobile_settings(n_clicks, is_open):
+    if n_clicks:
+        new_state = not is_open
+        return new_state, "▲" if new_state else "▼"
+    return is_open, "▼"
+
+
+# =============================================================================
+# HELP SYSTEM CALLBACKS
+# =============================================================================
+
+# Help content for each feature
+HELP_CONTENT = {
+    "ps": {
+        "title": "Ps Contours (Specific Excess Power)",
+        "body": """
+**Ps (Specific Excess Power)** represents the rate at which the aircraft can gain or lose energy per unit weight, expressed in feet per second.
+
+**How to interpret:**
+- **Positive Ps** (solid lines): The aircraft has excess power and can climb or accelerate
+- **Zero Ps** (dashed line): The aircraft is at its performance limit - it can maintain speed and altitude but cannot climb or accelerate
+- **Negative Ps** (inside the zero line): The aircraft is losing energy and must descend or decelerate
+
+**Practical use:**
+- Find the airspeed/turn rate combination where Ps = 0 to know your sustained turn capability
+- Higher Ps values indicate better climb performance at that flight condition
+- Use this to compare sustained vs instantaneous maneuvering capability
+"""
+    },
+    "g": {
+        "title": "Intermediate G Lines",
+        "body": """
+**G-Lines** show constant load factor (G) contours across the maneuvering envelope.
+
+**What load factor means:**
+- **1G**: Level, unaccelerated flight
+- **2G**: The aircraft experiences twice its weight (common in 60° bank turns)
+- **Higher G**: More aggressive maneuvering, higher structural and physiological loads
+
+**How to interpret:**
+- Each line represents a specific G loading
+- Where a G-line intersects the stall boundary shows the minimum speed to achieve that G
+- The lines help visualize how turn rate relates to load factor and airspeed
+
+**Practical use:**
+- Identify sustainable G levels for extended maneuvering
+- Plan maneuvers that stay within structural and physiological limits
+- Understand the relationship between bank angle, G, and turn performance
+"""
+    },
+    "radius": {
+        "title": "Turn Radius Lines",
+        "body": """
+**Turn Radius Lines** show constant-radius turn contours in feet.
+
+**How to interpret:**
+- Each curved line represents a specific turn radius
+- Smaller radius = tighter turn (more aggressive maneuvering)
+- Turn radius depends on both airspeed and turn rate
+
+**Key relationships:**
+- Higher speeds at the same turn rate = larger radius
+- Higher turn rates at the same speed = smaller radius
+- Minimum radius occurs at the intersection of stall boundary and structural limit
+
+**Practical use:**
+- Plan ground reference maneuvers with specific radius requirements
+- Evaluate maneuvering capability in confined airspace
+- Compare different speed/bank combinations that achieve the same radius
+"""
+    },
+    "aob": {
+        "title": "Angle of Bank Shading",
+        "body": """
+**Angle of Bank (AOB) Shading** shows the bank angle required to achieve each turn rate at various airspeeds.
+
+**Color interpretation:**
+- Lighter shades = shallow bank angles (30-45°)
+- Darker shades = steep bank angles (60°+)
+- The color gradient helps visualize how bank angle varies across the envelope
+
+**Key relationships:**
+- At a given turn rate, higher speeds require steeper bank angles
+- At a given speed, higher turn rates require steeper bank angles
+- Bank angle directly relates to load factor: G = 1/cos(bank)
+
+**Practical use:**
+- Quickly identify the bank angle needed for a desired turn rate
+- Plan steep turns and chandelles at appropriate speeds
+- Understand the transition from shallow to steep maneuvering
+"""
+    },
+    "negative_g": {
+        "title": "Negative G Envelope",
+        "body": """
+**Negative G Envelope** shows the aircraft's capability when flying at negative (pushed) load factors.
+
+**What this represents:**
+- The region where the aircraft is being "pushed" rather than "pulled"
+- Occurs during inverted flight, pushovers, or outside maneuvers
+- Limited by negative G structural limits and inverted stall characteristics
+
+**Key assumptions:**
+- The aircraft is being pushed to maintain level flight attitude
+- Negative G stall speeds are typically higher than positive G
+- Structural negative G limits are usually lower than positive limits
+
+**Practical use:**
+- Understand the full maneuvering envelope including unusual attitudes
+- Plan recovery from unusual attitudes within structural limits
+- Useful for aerobatic flight planning
+"""
+    },
+    "dvmc": {
+        "title": "Dynamic Vmc",
+        "body": """
+**Dynamic Vmc** shows how the minimum control speed with one engine inoperative varies with flight conditions.
+
+**What affects DVmc:**
+- **Weight**: Lighter weight = higher Vmc (less rudder authority relative to asymmetric thrust)
+- **Density altitude**: Higher DA = lower Vmc (reduced engine power)
+- **Bank angle**: 5° into good engine = lowest Vmc; deviations increase it
+- **CG position**: Aft CG = higher Vmc (reduced rudder moment arm)
+- **Prop condition**: Windmilling = highest Vmc; feathered = lowest
+
+**How to interpret:**
+- The DVmc line shows Vmc at various bank angles
+- Points above the line are controllable; below may not be
+- The published Vmc is a certification point at specific conditions
+
+**Safety note:**
+- DVmc shows where directional control is lost
+- Always maintain above DVmc during OEI operations
+- Real-world Vmc depends on many factors - this is a planning tool
+"""
+    },
+    "dvyse": {
+        "title": "Dynamic Vyse",
+        "body": """
+**Dynamic Vyse** shows how the best single-engine rate of climb speed varies with conditions.
+
+**What affects DVyse:**
+- **Weight**: Higher weight = higher Vyse
+- **Density altitude**: Higher DA = higher Vyse
+- **Configuration**: Gear/flaps extended = higher Vyse
+- **Prop condition**: Affects drag and thus optimal speed
+
+**How to interpret:**
+- The DVyse marker shows the calculated best single-engine climb speed
+- This is where you'll get maximum climb (or minimum sink) on one engine
+- Published Vyse is based on standard conditions and max weight
+
+**Practical use:**
+- Adjust Vyse for actual conditions during OEI operations
+- Lighter weight at altitude may require a different target speed
+- Use in conjunction with DVmc to understand the OEI speed envelope
+"""
+    },
+    "fpa": {
+        "title": "Flight Path Angle",
+        "body": """
+**Flight Path Angle** adjusts the EM diagram for climbing or descending flight.
+
+**What it represents:**
+- **0°**: Level flight (default)
+- **Positive angles**: Climbing - aircraft exchanges kinetic for potential energy
+- **Negative angles**: Descending - aircraft gains kinetic energy from altitude
+
+**Effect on the diagram:**
+- Climbing reduces available excess power for maneuvering
+- Descending increases available energy (but altitude is being spent)
+- The diagram shifts to reflect changed energy state
+
+**Practical use:**
+- Analyze climb performance during maneuvering
+- Plan maneuvers during approach or departure segments
+- Understand how climb/descent affects turn performance
+"""
+    },
+    "maneuver": {
+        "title": "Maneuver Overlays & Ghost Trace",
+        "body": """
+**Maneuver Overlays** trace the energy state throughout specific flight maneuvers.
+
+**Steep Turn:**
+- Shows the trajectory through the EM diagram during a constant-altitude steep turn
+- Traces from entry through established turn
+- Helps verify the aircraft has sufficient Ps to maintain altitude
+
+**Chandelle:**
+- Shows the climbing turn trajectory
+- Entry speed, bank angle, and climb combine to trace a path
+- Useful for planning energy management through the maneuver
+
+**Ghost Trace:**
+The Ghost Trace toggle displays a visual path showing how the maneuver progresses through the EM diagram:
+- Shows the trajectory from entry conditions through the maneuver
+- Visualizes how airspeed and turn rate change during the maneuver
+- Helps identify if you have enough Ps margin to maintain altitude/complete the maneuver
+
+**ACS Standards (Steep Turns):**
+- **Private**: 45° bank angle per ACS requirements
+- **Commercial**: 50° bank angle per ACS requirements
+
+**How to interpret:**
+- The trace shows where in the envelope the maneuver takes you
+- If the trace crosses negative Ps regions, altitude/speed will be lost
+- Staying in positive Ps regions means the maneuver is sustainable
+
+**Practical use:**
+- Verify maneuver feasibility before attempting
+- Optimize entry speeds and bank angles
+- Understand energy trade-offs during complex maneuvers
+"""
+    },
+    "ghost": {
+        "title": "Ghost Trace",
+        "body": """
+**Ghost Trace** displays a visual path showing how a maneuver progresses through the EM diagram.
+
+**What it shows:**
+- The trajectory from entry conditions through the maneuver
+- How airspeed and turn rate change during the maneuver
+- Where the aircraft's energy state moves relative to the performance envelope
+
+**For Steep Turns:**
+- Shows the path from straight-and-level entry into the established turn
+- Visualizes the speed/energy trade-off during roll-in
+- Helps identify if you have enough Ps margin to maintain altitude
+
+**For Chandelles:**
+- Traces the climbing turn from entry through the 180° heading change
+- Shows energy state as speed bleeds off during the climb
+- Indicates if the maneuver will result in adequate final airspeed
+
+**ACS Standards (Steep Turns):**
+- **Private**: 45° bank angle requirement per ACS
+- **Commercial**: 50° bank angle requirement per ACS
+
+**Practical use:**
+- Preview maneuver energy requirements before flying
+- Optimize entry airspeed for maneuver completion
+- Understand why certain entry conditions may not work
+"""
+    }
+}
+
+
+@app.callback(
+    Output("overlay-toggle", "data"),
+    Input("toggle-ps", "value"),
+    Input("toggle-g", "value"),
+    Input("toggle-radius", "value"),
+    Input("toggle-aob", "value"),
+    Input("toggle-negative-g", "value"),
+    prevent_initial_call=True
+)
+def sync_overlay_switches(ps_on, g_on, radius_on, aob_on, neg_g_on):
+    """Sync individual overlay switches to the overlay-toggle store."""
+    selected = []
+    if ps_on:
+        selected.append("ps")
+    if g_on:
+        selected.append("g")
+    if radius_on:
+        selected.append("radius")
+    if aob_on:
+        selected.append("aob")
+    if neg_g_on:
+        selected.append("negative_g")
+    return selected
+
+
+@app.callback(
+    Output("multi-engine-toggle-options", "data"),
+    Input("toggle-vmca", "value"),
+    Input("toggle-vyse", "value"),
+    prevent_initial_call=True
+)
+def sync_me_switches(vmca_on, vyse_on):
+    """Sync multi-engine switches to the multi-engine-toggle-options store."""
+    selected = []
+    if vmca_on:
+        selected.append("vmca")
+    if vyse_on:
+        selected.append("dynamic_vyse")
+    return selected
+
+
+@app.callback(
+    Output("help-modal", "is_open"),
+    Output("help-modal-title", "children"),
+    Output("help-modal-body", "children"),
+    Input("help-ps", "n_clicks"),
+    Input("help-g", "n_clicks"),
+    Input("help-radius", "n_clicks"),
+    Input("help-aob", "n_clicks"),
+    Input("help-negative-g", "n_clicks"),
+    Input("help-dvmc", "n_clicks"),
+    Input("help-dvyse", "n_clicks"),
+    Input("help-fpa", "n_clicks"),
+    Input("help-maneuver", "n_clicks"),
+    Input("help-ghost", "n_clicks"),
+    Input("close-help-modal", "n_clicks"),
+    State("help-modal", "is_open"),
+    prevent_initial_call=True
+)
+def toggle_help_modal(ps, g, radius, aob, neg_g, dvmc, dvyse, fpa, maneuver, ghost, close, is_open):
+    """Handle help icon clicks and display appropriate content."""
+    if not ctx.triggered:
+        raise PreventUpdate
+
+    triggered_id = ctx.triggered_id
+
+    # Extra guard: ensure this is an actual click (n_clicks > 0)
+    triggered_value = ctx.triggered[0]["value"] if ctx.triggered else None
+    if triggered_value is None or triggered_value == 0:
+        raise PreventUpdate
+
+    # Close button
+    if triggered_id == "close-help-modal":
+        return False, "", ""
+
+    # Map triggered ID to help topic
+    topic_map = {
+        "help-ps": "ps",
+        "help-g": "g",
+        "help-radius": "radius",
+        "help-aob": "aob",
+        "help-negative-g": "negative_g",
+        "help-dvmc": "dvmc",
+        "help-dvyse": "dvyse",
+        "help-fpa": "fpa",
+        "help-maneuver": "maneuver",
+        "help-ghost": "ghost"
+    }
+
+    topic = topic_map.get(triggered_id)
+    if topic and topic in HELP_CONTENT:
+        content = HELP_CONTENT[topic]
+        # Convert markdown to HTML using dcc.Markdown
+        body = dcc.Markdown(content["body"], style={"lineHeight": "1.6"})
+        return True, content["title"], body
+
+    raise PreventUpdate
 
 
 @app.server.route("/robots.txt")
@@ -4457,5 +5550,6 @@ if __name__ == "__main__":
     # Use env var to control debug (1 = on, 0 = off)
     debug_mode = os.environ.get("AEROEDGE_DEBUG", "1") == "1"
 
-    # Local: 127.0.0.1 is fine, Render will override host/port anyway
-    app.run(debug=debug_mode, host="127.0.0.1", port=8050)
+    # Use 0.0.0.0 to allow access from other devices on the network
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8051
+    app.run(debug=debug_mode, host="0.0.0.0", port=port)
