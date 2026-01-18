@@ -3860,58 +3860,11 @@ def load_aircraft_full(selected_name):
         })
 
 
-    # --- Populate text inputs
-    aircraft_name = selected_name
-    wing_area = ac.get("wing_area")
-    aspect_ratio = ac.get("aspect_ratio")
-    cd0 = ac.get("CD0")
-    oswald = ac.get("e")
-
-    # --- Populate G Limits
-    g_limits = ac.get("G_limits", {})
-    g_limit_fields = [
-        dcc.Textarea(
-            id="g-limits",
-            value=json.dumps(g_limits, indent=2),
-            style={"width": "400px", "height": "200px"},
-        )
-    ]
-
-    # --- Populate Stall Speeds
-    stall_speeds = list(ac.get("stall_speeds", {}).keys())
-    stall_speed_fields = [
-        dcc.Textarea(
-            id="stall-speeds",
-            value=json.dumps(stall_speeds, indent=2),
-            style={"width": "400px", "height": "200px"},
-        )
-    ]
-
-
-    # --- Populate Engine Options
-    engine_options = ac.get("engine_options", {})
-    engine_fields = [
-        dcc.Textarea(
-            id="engine-options",
-            value=json.dumps(engine_options, indent=2),
-            style={"width": "400px", "height": "200px"},
-        )
-    ]
-
-
-    
-    
-    # --- Flap CLmax and Vfe (Standardized)
-    clmax_data = ac.get("CL_max", {})
-    vfe_data = ac.get("Vfe", {})
-    
-    vfe_clean = ac.get("Vfe", {}).get("clean", None)
-    vfe_takeoff = ac.get("Vfe", {}).get("takeoff", None)
-    vfe_landing = ac.get("Vfe", {}).get("landing", None)
-
-    clmax_clean = ac.get("CL_max", {}).get("clean", None)
-    clmax_takeoff = ac.get("CL_max", {}).get("takeoff", None)
-    clmax_landing = ac.get("CL_max", {}).get("landing", None)
+    # Container children are left empty - the render callbacks will
+    # populate them from the stored data (stored_g_limits, etc.)
+    g_limit_fields = []
+    stall_speed_fields = []
+    engine_fields = []
 
     # --- Prop Thrust Decay
     prop_decay = ac.get("prop_thrust_decay", {})
@@ -3939,7 +3892,7 @@ def load_aircraft_full(selected_name):
             for prop_condition, values in config_data.items():
                 oei_flat.append({
                     "engine": eng_name,
-                    "config_key": config_key,
+                    "config": config_key,  # Use "config" for consistency with add/render callbacks
                     "prop_condition": prop_condition,
                     "max_power_fraction": values.get("max_power_fraction"),
                 })
@@ -3993,119 +3946,387 @@ def load_aircraft_full(selected_name):
     )
 
 @app.callback(
+    # Basic info
+    Output("aircraft-type", "value", allow_duplicate=True),
+    Output("gear-type", "value", allow_duplicate=True),
+    Output("engine-count", "value", allow_duplicate=True),
+    # Aerodynamics
+    Output("wing-area", "value", allow_duplicate=True),
+    Output("aspect-ratio", "value", allow_duplicate=True),
     Output("cd0", "value", allow_duplicate=True),
     Output("oswald-efficiency", "value", allow_duplicate=True),
     Output("prop-static-factor", "value", allow_duplicate=True),
     Output("prop-vmax-kts", "value", allow_duplicate=True),
+    # Weights
+    Output("empty-weight", "value", allow_duplicate=True),
+    Output("max-weight", "value", allow_duplicate=True),
+    Output("seats", "value", allow_duplicate=True),
+    Output("fuel-capacity-gal", "value", allow_duplicate=True),
     Output("fuel-weight-per-gal", "value", allow_duplicate=True),
-    Output("stored-engine-options", "data", allow_duplicate=True),
-    Output("stored-flap-configs", "data", allow_duplicate=True),
-    Output("stored-oei-performance", "data", allow_duplicate=True),
+    # Speeds
+    Output("vne", "value", allow_duplicate=True),
+    Output("vno", "value", allow_duplicate=True),
+    Output("best-glide", "value", allow_duplicate=True),
+    Output("best-glide-ratio", "value", allow_duplicate=True),
+    Output("max-altitude", "value", allow_duplicate=True),
+    # Arcs
+    Output("arc-white-bottom", "value", allow_duplicate=True),
+    Output("arc-white-top", "value", allow_duplicate=True),
+    Output("arc-green-bottom", "value", allow_duplicate=True),
+    Output("arc-green-top", "value", allow_duplicate=True),
+    Output("arc-yellow-bottom", "value", allow_duplicate=True),
+    Output("arc-yellow-top", "value", allow_duplicate=True),
+    Output("arc-red", "value", allow_duplicate=True),
+    # Flaps
+    Output({"type": "vfe-input", "config": "takeoff"}, "value", allow_duplicate=True),
+    Output({"type": "vfe-input", "config": "landing"}, "value", allow_duplicate=True),
     Output({"type": "clmax-input", "config": "clean"}, "value", allow_duplicate=True),
     Output({"type": "clmax-input", "config": "takeoff"}, "value", allow_duplicate=True),
     Output({"type": "clmax-input", "config": "landing"}, "value", allow_duplicate=True),
+    # Stores
+    Output("stored-engine-options", "data", allow_duplicate=True),
+    Output("stored-g-limits", "data", allow_duplicate=True),
+    Output("stored-stall-speeds", "data", allow_duplicate=True),
+    Output("stored-oei-performance", "data", allow_duplicate=True),
+    # Inputs
+    Input("default-trainer", "n_clicks"),
     Input("default-single", "n_clicks"),
+    Input("default-highperf", "n_clicks"),
     Input("default-multi", "n_clicks"),
     Input("default-aerobatic", "n_clicks"),
-    Input("default-trainer", "n_clicks"),
-    Input("default-mil-trainer", "n_clicks"),
     Input("default-experimental", "n_clicks"),
-    State("stored-flap-configs", "data"),
-    State("stored-oei-performance", "data"),
-    State("engine-count", "value"),
     prevent_initial_call=True
 )
-def apply_default_performance(single, multi, aero, trainer, mil, exp, flap_data, oei_data, engine_count):
+def apply_default_performance(trainer, single, highperf, multi, aero, exp):
     triggered = ctx.triggered_id
 
-    if triggered == "default-single":
-        cd0, e, t_static, vmax, fuel_wt = 0.025, 0.80, 2.6, 160, 6.0
-        engine = {
-            "name": "Lycoming O-320",
-            "horsepower": 150,
-            "power_curve_sea_level": 150,
-            "power_curve_derate": 0.03
-        }
-        clmax = {"clean": 1.4, "takeoff": 1.7, "landing": 2.0}
+    # Define comprehensive defaults for each category
+    defaults = {
+        "default-trainer": {
+            # Basic Trainer: C150, C152, PA-28-140, DA20
+            "aircraft_type": "single_engine",
+            "gear_type": "fixed",
+            "engine_count": 1,
+            "wing_area": 160,
+            "aspect_ratio": 6.8,
+            "cd0": 0.028,
+            "e": 0.78,
+            "t_static": 2.5,
+            "vmax": 125,
+            "empty_weight": 1100,
+            "max_weight": 1670,
+            "seats": 2,
+            "fuel_capacity": 26,
+            "fuel_weight": 6.0,
+            "vne": 140,
+            "vno": 111,
+            "best_glide": 60,
+            "glide_ratio": 8.5,
+            "ceiling": 14000,
+            "arcs": {"white": [42, 85], "green": [48, 111], "yellow": [111, 140], "red": 140},
+            "vfe": {"takeoff": 100, "landing": 85},
+            "clmax": {"clean": 1.45, "takeoff": 1.7, "landing": 2.0},
+            "engine": {"name": "Continental O-200-A", "hp": 100, "derate": 0.03},
+            "g_limits": [
+                {"category": "normal", "config": "clean", "positive": 3.8, "negative": -1.52},
+                {"category": "normal", "config": "takeoff", "positive": 2.0, "negative": -1.0},
+                {"category": "normal", "config": "landing", "positive": 2.0, "negative": -1.0},
+            ],
+            "stall_speeds": [
+                {"config": "clean", "weight": 1670, "speed": 48},
+                {"config": "takeoff", "weight": 1670, "speed": 44},
+                {"config": "landing", "weight": 1670, "speed": 42},
+            ],
+        },
+        "default-single": {
+            # Standard Single: C172, PA-28-181, DA40, SR20
+            "aircraft_type": "single_engine",
+            "gear_type": "fixed",
+            "engine_count": 1,
+            "wing_area": 174,
+            "aspect_ratio": 7.32,
+            "cd0": 0.027,
+            "e": 0.80,
+            "t_static": 2.6,
+            "vmax": 163,
+            "empty_weight": 1660,
+            "max_weight": 2550,
+            "seats": 4,
+            "fuel_capacity": 56,
+            "fuel_weight": 6.0,
+            "vne": 163,
+            "vno": 129,
+            "best_glide": 68,
+            "glide_ratio": 9.0,
+            "ceiling": 14000,
+            "arcs": {"white": [41, 85], "green": [47, 129], "yellow": [129, 163], "red": 163},
+            "vfe": {"takeoff": 110, "landing": 85},
+            "clmax": {"clean": 1.5, "takeoff": 1.7, "landing": 1.9},
+            "engine": {"name": "Lycoming IO-360-L2A", "hp": 180, "derate": 0.03},
+            "g_limits": [
+                {"category": "normal", "config": "clean", "positive": 3.8, "negative": -1.52},
+                {"category": "normal", "config": "takeoff", "positive": 2.0, "negative": -1.0},
+                {"category": "normal", "config": "landing", "positive": 2.0, "negative": -1.0},
+            ],
+            "stall_speeds": [
+                {"config": "clean", "weight": 2550, "speed": 53},
+                {"config": "clean", "weight": 2200, "speed": 49},
+                {"config": "takeoff", "weight": 2550, "speed": 50},
+                {"config": "landing", "weight": 2550, "speed": 47},
+            ],
+        },
+        "default-highperf": {
+            # High Performance: C182, Bonanza, Mooney, SR22
+            "aircraft_type": "single_engine",
+            "gear_type": "retractable",
+            "engine_count": 1,
+            "wing_area": 175,
+            "aspect_ratio": 7.4,
+            "cd0": 0.024,
+            "e": 0.82,
+            "t_static": 2.7,
+            "vmax": 200,
+            "empty_weight": 2100,
+            "max_weight": 3400,
+            "seats": 4,
+            "fuel_capacity": 92,
+            "fuel_weight": 6.0,
+            "vne": 200,
+            "vno": 165,
+            "best_glide": 90,
+            "glide_ratio": 10.5,
+            "ceiling": 18500,
+            "arcs": {"white": [50, 100], "green": [58, 165], "yellow": [165, 200], "red": 200},
+            "vfe": {"takeoff": 120, "landing": 100},
+            "clmax": {"clean": 1.4, "takeoff": 1.65, "landing": 1.95},
+            "engine": {"name": "Continental IO-550-N", "hp": 310, "derate": 0.025},
+            "g_limits": [
+                {"category": "normal", "config": "clean", "positive": 3.8, "negative": -1.52},
+                {"category": "normal", "config": "takeoff", "positive": 2.0, "negative": -1.0},
+                {"category": "normal", "config": "landing", "positive": 2.0, "negative": -1.0},
+            ],
+            "stall_speeds": [
+                {"config": "clean", "weight": 3400, "speed": 63},
+                {"config": "clean", "weight": 2800, "speed": 57},
+                {"config": "takeoff", "weight": 3400, "speed": 58},
+                {"config": "landing", "weight": 3400, "speed": 53},
+            ],
+        },
+        "default-multi": {
+            # Light Twin: PA-44, DA42, Baron 58
+            "aircraft_type": "multi_engine",
+            "gear_type": "retractable",
+            "engine_count": 2,
+            "wing_area": 183,
+            "aspect_ratio": 7.2,
+            "cd0": 0.028,
+            "e": 0.80,
+            "t_static": 2.6,
+            "vmax": 202,
+            "empty_weight": 2570,
+            "max_weight": 3800,
+            "seats": 4,
+            "fuel_capacity": 110,
+            "fuel_weight": 6.0,
+            "vne": 202,
+            "vno": 169,
+            "best_glide": 88,
+            "glide_ratio": 9.5,
+            "ceiling": 15000,
+            "arcs": {"white": [55, 108], "green": [64, 169], "yellow": [169, 202], "red": 202},
+            "vfe": {"takeoff": 125, "landing": 108},
+            "clmax": {"clean": 1.35, "takeoff": 1.6, "landing": 1.95},
+            "engine": {"name": "Lycoming IO-360-A1B6", "hp": 180, "derate": 0.03},
+            "g_limits": [
+                {"category": "normal", "config": "clean", "positive": 3.8, "negative": -1.52},
+                {"category": "normal", "config": "takeoff", "positive": 2.0, "negative": -1.0},
+                {"category": "normal", "config": "landing", "positive": 2.0, "negative": -1.0},
+            ],
+            "stall_speeds": [
+                {"config": "clean", "weight": 3800, "speed": 68},
+                {"config": "clean", "weight": 3200, "speed": 62},
+                {"config": "takeoff", "weight": 3800, "speed": 63},
+                {"config": "landing", "weight": 3800, "speed": 58},
+            ],
+            "oei": [
+                {"config": "clean_up", "prop_condition": "feathered", "max_power_fraction": 0.5},
+                {"config": "clean_up", "prop_condition": "windmilling", "max_power_fraction": 0.45},
+            ],
+        },
+        "default-aerobatic": {
+            # Aerobatic: Extra 300, Pitts, CAP 232, Decathlon
+            "aircraft_type": "single_engine",
+            "gear_type": "fixed",
+            "engine_count": 1,
+            "wing_area": 100,
+            "aspect_ratio": 5.0,
+            "cd0": 0.030,
+            "e": 0.75,
+            "t_static": 2.8,
+            "vmax": 220,
+            "empty_weight": 1100,
+            "max_weight": 1650,
+            "seats": 2,
+            "fuel_capacity": 40,
+            "fuel_weight": 6.0,
+            "vne": 220,
+            "vno": 163,
+            "best_glide": 100,
+            "glide_ratio": 8.0,
+            "ceiling": 16000,
+            "arcs": {"white": [54, 100], "green": [61, 163], "yellow": [163, 220], "red": 220},
+            "vfe": {"takeoff": None, "landing": 100},
+            "clmax": {"clean": 1.6, "takeoff": 1.8, "landing": 2.1},
+            "engine": {"name": "Lycoming AEIO-540", "hp": 300, "derate": 0.025},
+            "g_limits": [
+                {"category": "aerobatic", "config": "clean", "positive": 6.0, "negative": -3.0},
+                {"category": "aerobatic", "config": "takeoff", "positive": 6.0, "negative": -3.0},
+                {"category": "aerobatic", "config": "landing", "positive": 6.0, "negative": -3.0},
+            ],
+            "stall_speeds": [
+                {"config": "clean", "weight": 1650, "speed": 61},
+                {"config": "clean", "weight": 1400, "speed": 56},
+                {"config": "landing", "weight": 1650, "speed": 54},
+            ],
+        },
+        "default-experimental": {
+            # LSA/Experimental: RV-12, CTLS, SportStar
+            "aircraft_type": "single_engine",
+            "gear_type": "fixed",
+            "engine_count": 1,
+            "wing_area": 120,
+            "aspect_ratio": 8.5,
+            "cd0": 0.025,
+            "e": 0.82,
+            "t_static": 2.5,
+            "vmax": 138,
+            "empty_weight": 750,
+            "max_weight": 1320,
+            "seats": 2,
+            "fuel_capacity": 24,
+            "fuel_weight": 6.0,
+            "vne": 138,
+            "vno": 108,
+            "best_glide": 70,
+            "glide_ratio": 11.0,
+            "ceiling": 12000,
+            "arcs": {"white": [37, 80], "green": [45, 108], "yellow": [108, 138], "red": 138},
+            "vfe": {"takeoff": 90, "landing": 80},
+            "clmax": {"clean": 1.45, "takeoff": 1.75, "landing": 2.05},
+            "engine": {"name": "Rotax 912 ULS", "hp": 100, "derate": 0.03},
+            "g_limits": [
+                {"category": "normal", "config": "clean", "positive": 4.0, "negative": -2.0},
+                {"category": "normal", "config": "takeoff", "positive": 4.0, "negative": -2.0},
+                {"category": "normal", "config": "landing", "positive": 4.0, "negative": -2.0},
+            ],
+            "stall_speeds": [
+                {"config": "clean", "weight": 1320, "speed": 45},
+                {"config": "takeoff", "weight": 1320, "speed": 41},
+                {"config": "landing", "weight": 1320, "speed": 37},
+            ],
+        },
+    }
 
-    elif triggered == "default-multi":
-        cd0, e, t_static, vmax, fuel_wt = 0.028, 0.82, 2.6, 180, 6.0
-        engine = {
-            "name": "Lycoming TIO-540",
-            "horsepower": 220,
-            "power_curve_sea_level": 220,
-            "power_curve_derate": 0.035
-        }
-        clmax = {"clean": 1.3, "takeoff": 1.6, "landing": 2.0}
-
-    elif triggered == "default-aerobatic":
-        cd0, e, t_static, vmax, fuel_wt = 0.030, 0.75, 2.6, 200, 6.0
-        engine = {
-            "name": "Lycoming AEIO-360",
-            "horsepower": 200,
-            "power_curve_sea_level": 200,
-            "power_curve_derate": 0.03
-        }
-        clmax = {"clean": 1.6, "takeoff": 1.8, "landing": 2.2}
-
-    elif triggered == "default-trainer":
-        cd0, e, t_static, vmax, fuel_wt = 0.027, 0.78, 2.6, 140, 6.0        
-        engine = {
-            "name": "Continental O-200",
-            "horsepower": 100,
-            "power_curve_sea_level": 100,
-            "power_curve_derate": 0.03
-        }
-        clmax = {"clean": 1.3, "takeoff": 1.6, "landing": 2.0}
-
-    elif triggered == "default-mil-trainer":
-        cd0, e, t_static, vmax, fuel_wt = 0.030, 0.72, 2.6, 300, 6.7        
-        engine = {
-            "name": "Pratt & Whitney R-1340",
-            "horsepower": 600,
-            "power_curve_sea_level": 600,
-            "power_curve_derate": 0.02
-        }
-        clmax = {"clean": 1.4, "takeoff": 1.6, "landing": 2.2}
-
-    elif triggered == "default-experimental":
-        cd0, e, t_static, vmax, fuel_wt = 0.026, 0.80, 2.6, 180, 6.0        
-        engine = {
-            "name": "Rotax 912 ULS",
-            "horsepower": 100,
-            "power_curve_sea_level": 100,
-            "power_curve_derate": 0.03
-        }
-        clmax = {"clean": 1.4, "takeoff": 1.7, "landing": 2.1}
-
-    else:
+    if triggered not in defaults:
         raise PreventUpdate
 
-    # One engine entry only
-    updated_engines = [engine]
+    d = defaults[triggered]
+    arcs = d["arcs"]
+    clmax = d["clmax"]
+    vfe = d["vfe"]
+    eng = d["engine"]
 
-    # Update flap configs (set clmax if not present)
-    updated_flaps = []
-    for f in ["clean", "takeoff", "landing"]:
-        updated_flaps.append({"name": f, "clmax": clmax[f]})
+    # Build engine options
+    engine_options = [{
+        "name": eng["name"],
+        "horsepower": eng["hp"],
+        "power_curve_sea_level": eng["hp"],
+        "power_curve_derate": eng["derate"]
+    }]
 
-    # OEI logic (only for multi)
-    if (engine_count and engine_count >= 2) or triggered == "default-multi":
-        updated_oei = [
-            {"config": "clean_up", "prop_condition": "stationary", "max_power_fraction": 0.5},
-            {"config": "clean_up", "prop_condition": "windmilling", "max_power_fraction": 0.5},
-            {"config": "clean_up", "prop_condition": "normal", "max_power_fraction": 0.5}
-        ]
-    else:
-        updated_oei = dash.no_update
+    # OEI data for multi-engine
+    oei_data = d.get("oei", [])
 
     return (
-        cd0, e, t_static, vmax, fuel_wt,
-        updated_engines,
-        updated_flaps,
-        updated_oei,
-        clmax["clean"], clmax["takeoff"], clmax["landing"]
+        # Basic info
+        d["aircraft_type"],
+        d["gear_type"],
+        d["engine_count"],
+        # Aerodynamics
+        d["wing_area"],
+        d["aspect_ratio"],
+        d["cd0"],
+        d["e"],
+        d["t_static"],
+        d["vmax"],
+        # Weights
+        d["empty_weight"],
+        d["max_weight"],
+        d["seats"],
+        d["fuel_capacity"],
+        d["fuel_weight"],
+        # Speeds
+        d["vne"],
+        d["vno"],
+        d["best_glide"],
+        d["glide_ratio"],
+        d["ceiling"],
+        # Arcs
+        arcs["white"][0],
+        arcs["white"][1],
+        arcs["green"][0],
+        arcs["green"][1],
+        arcs["yellow"][0],
+        arcs["yellow"][1],
+        arcs["red"],
+        # Flaps
+        vfe["takeoff"],
+        vfe["landing"],
+        clmax["clean"],
+        clmax["takeoff"],
+        clmax["landing"],
+        # Stores
+        engine_options,
+        d["g_limits"],
+        d["stall_speeds"],
+        oei_data,
     )
+
+# Hide multi-engine sections for single-engine aircraft
+@app.callback(
+    Output("multi-engine-sections", "style"),
+    Input("aircraft-type", "value"),
+    prevent_initial_call=True
+)
+def toggle_multi_engine_sections(aircraft_type):
+    if aircraft_type == "multi_engine":
+        return {"display": "block"}
+    else:
+        return {"display": "none"}
+
+# Sync units toggle switch with hidden input
+@app.callback(
+    Output("units-toggle", "value"),
+    Input("units-toggle-switch", "value"),
+    prevent_initial_call=True
+)
+def sync_units_toggle(switch_value):
+    return "MPH" if switch_value else "KIAS"
+
+# Expand/Collapse all accordions
+@app.callback(
+    Output("edit-accordion", "active_item"),
+    Input("expand-all-btn", "n_clicks"),
+    Input("collapse-all-btn", "n_clicks"),
+    prevent_initial_call=True
+)
+def expand_collapse_all(expand_clicks, collapse_clicks):
+    triggered = ctx.triggered_id
+    all_items = ["basic", "aero", "weight", "speeds", "flaps", "glimits", "stall", "engines"]
+    if triggered == "expand-all-btn":
+        return all_items
+    else:
+        return []
 
 # ---- G LIMITS ----
 
@@ -4640,6 +4861,7 @@ def update_or_remove_engines(names, hps, sea_levels, derates, remove_clicks, cur
     [
         Output("aircraft-name", "value", allow_duplicate=True),
         Output("aircraft-type", "value", allow_duplicate=True),
+        Output("gear-type", "value", allow_duplicate=True),
         Output("engine-count", "value", allow_duplicate=True),
         Output("wing-area", "value", allow_duplicate=True),
         Output("aspect-ratio", "value", allow_duplicate=True),
@@ -4689,6 +4911,7 @@ def clear_all_fields(n_clicks):
     return (
         "",  # aircraft-name
         "",  # aircraft-type
+        "fixed",  # gear-type
         1,   # engine-count
         None,  # wing-area
         None,  # aspect-ratio
@@ -4822,6 +5045,50 @@ def convert_units_toggle(units,
     )
 
 
+def _build_single_engine_limits(se_limits, best_glide, best_glide_ratio):
+    """
+    Build the single_engine_limits dict with proper nesting for multi-engine aircraft.
+
+    Input se_limits format (list of dicts):
+        {"limit_type": "Vmca", "flap_config": "clean", "gear_config": "up", "value": 56}
+
+    Output format (matching JSON schema):
+        {
+            "Vmca": {"clean_up": 56, "takeoff_up": 56, ...},
+            "Vyse": {...},
+            "Vxse": {...},
+            "best_glide": 106,
+            "best_glide_ratio": 9.5
+        }
+    """
+    result = {}
+
+    # Group by limit_type with config keys
+    for s in (se_limits or []):
+        limit_type = s.get("limit_type")
+        if not limit_type:
+            continue
+
+        flap = s.get("flap_config", "clean")
+        gear = s.get("gear_config", "up")
+        value = s.get("value")
+
+        # Build config key like "clean_up", "takeoff_down", "landing_down"
+        config_key = f"{flap}_{gear}"
+
+        if limit_type not in result:
+            result[limit_type] = {}
+
+        result[limit_type][config_key] = value
+
+    # Add best glide info
+    if best_glide is not None:
+        result["best_glide"] = best_glide
+    if best_glide_ratio is not None:
+        result["best_glide_ratio"] = best_glide_ratio
+
+    return result
+
 
 @app.callback(
     [
@@ -4872,6 +5139,7 @@ def convert_units_toggle(units,
     State({"type": "clmax-input", "config": "landing"}, "value"),
     State("max-altitude", "value"),
     State("gear-type", "value"),
+    State("stored-oei-performance", "data"),
     prevent_initial_call=True
 )
 def save_aircraft_to_file(
@@ -4882,8 +5150,8 @@ def save_aircraft_to_file(
     units, empty_weight, max_weight, seats, cg_fwd, cg_aft, fuel_capacity, fuel_weight,
     white_btm, white_top, green_btm, green_top, yellow_btm, yellow_top, red,
     t_static, v_max_kts, best_glide, best_glide_ratio, aircraft_type, engine_count, vne, vno,
-    vfe_takeoff, vfe_landing, 
-    clmax_clean, clmax_takeoff, clmax_landing, max_altitude, gear_type
+    vfe_takeoff, vfe_landing,
+    clmax_clean, clmax_takeoff, clmax_landing, max_altitude, gear_type, oei_performance
 ):
     if not name:
         return (
@@ -4916,17 +5184,38 @@ def save_aircraft_to_file(
             } for s in (se_limits or [])
         ]
 
-        # --- Engines ---
+        # --- Engines with OEI Performance ---
         engine_dict = {}
         if engines:
             for eng in engines:
-                engine_dict[eng.get("name", "Unnamed Engine")] = {
+                eng_name = eng.get("name", "Unnamed Engine")
+                eng_data = {
                     "horsepower": eng.get("horsepower"),
                     "power_curve": {
                         "sea_level_max": eng.get("power_curve_sea_level"),
                         "derate_per_1000ft": eng.get("power_curve_derate"),
                     },
                 }
+
+                # Build OEI performance structure for this engine
+                # OEI data is stored flat with config (e.g. "clean_up") and prop_condition
+                oei_struct = {}
+                for oei in (oei_performance or []):
+                    # Handle both "config" and "config_key" for compatibility
+                    config_key = oei.get("config") or oei.get("config_key", "clean_up")
+                    prop_cond = oei.get("prop_condition", "feathered").lower()
+
+                    if config_key not in oei_struct:
+                        oei_struct[config_key] = {}
+
+                    oei_struct[config_key][prop_cond] = {
+                        "max_power_fraction": oei.get("max_power_fraction"),
+                    }
+
+                if oei_struct:
+                    eng_data["oei_performance"] = oei_struct
+
+                engine_dict[eng_name] = eng_data
 
         # --- G limits ---
         g_structured = {}
@@ -4936,10 +5225,9 @@ def save_aircraft_to_file(
             pos = g.get("positive")
             neg = g.get("negative")
 
-            # NOTE: this still references g_neg from elsewhere; if that’s not defined
-            # we should either pass it as State or default neg to 0. For now, keep as-is.
+            # Default negative G to 0 if not specified
             if neg is None:
-                neg = g_neg  # <- existing behavior
+                neg = 0
 
             if cat and cfg:
                 g_structured.setdefault(cat, {})[cfg] = {
@@ -5006,14 +5294,9 @@ def save_aircraft_to_file(
             "arcs": arcs,
             "empty_weight": empty_weight,
             "max_weight": max_weight,
-            "single_engine_limits": {
-                **{
-                    s["limit_type"]: s["value"]
-                    for s in converted_se_limits if s["limit_type"]
-                },
-                "best_glide": best_glide,
-                "best_glide_ratio": best_glide_ratio,
-            },
+            "single_engine_limits": _build_single_engine_limits(
+                converted_se_limits, best_glide, best_glide_ratio
+            ),
             "seats": seats,
             "cg_range": [cg_fwd, cg_aft],
             "fuel_capacity_gal": fuel_capacity,
