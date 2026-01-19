@@ -74,7 +74,7 @@ app = dash.Dash(__name__, suppress_callback_exceptions=True, external_stylesheet
 server = app.server
 
 # Initialize usage tracking
-from aeroedge_tracker import init_tracking
+from aeroedge_tracker import init_tracking, log_feature
 init_tracking(server)
 
 
@@ -3468,6 +3468,15 @@ def generate_pdf(n_clicks, fig_data, ac_name, engine_name, config, gear, occupan
     if ctx.triggered_id != "pdf-button":
         return dash.no_update
 
+    # Track PDF export with configuration details
+    log_feature('diagram_export_pdf', {
+        'aircraft': ac_name,
+        'engine': engine_name,
+        'config': config,
+        'altitude': altitude,
+        'maneuver': maneuver
+    })
+
     fig = go.Figure(fig_data)
 
     # Generate timestamp
@@ -3593,6 +3602,15 @@ def generate_png(n_clicks, fig_data, ac_name, engine_name, config, gear, occupan
                  oat_c, speed_unit, cg_position, active_overlays):
     if ctx.triggered_id != "png-button":
         return dash.no_update
+
+    # Track PNG export with configuration details
+    log_feature('diagram_export_png', {
+        'aircraft': ac_name,
+        'engine': engine_name,
+        'config': config,
+        'altitude': altitude,
+        'maneuver': maneuver
+    })
 
     fig = go.Figure(fig_data)
 
@@ -3786,8 +3804,15 @@ def load_aircraft_full(selected_name):
     if not selected_name or selected_name not in aircraft_data:
         raise PreventUpdate
 
+    # Track aircraft selection with details
     ac = aircraft_data[selected_name]
-    
+    log_feature('aircraft_select', {
+        'aircraft': selected_name,
+        'type': ac.get('type', 'unknown'),
+        'engine_count': ac.get('engine_count', 1),
+        'category': ac.get('category', 'unknown')
+    })
+
     stored_flap_configs = ac.get("configuration_options", {}).get("flaps", [])
 
     stored_g_limits = []
@@ -5165,6 +5190,13 @@ def save_aircraft_to_file(
             dash.no_update,
         )
 
+    # Track aircraft save/creation
+    log_feature('aircraft_save', {
+        'aircraft': name,
+        'type': aircraft_type,
+        'engine_count': engine_count
+    })
+
     try:
         def convert_speed(val):
             return round(val / KTS_TO_MPH, 1) if units == "MPH" and isinstance(val, (int, float)) else val
@@ -5384,6 +5416,13 @@ def load_aircraft_from_upload(contents, filename, current_data):
         # Inject aircraft into stored dict
         current_data = current_data or {}
         current_data[name] = aircraft_json
+
+        # Track aircraft upload
+        log_feature('aircraft_upload', {
+            'aircraft': name,
+            'type': aircraft_json.get('type', 'unknown'),
+            'engine_count': aircraft_json.get('engine_count', 1)
+        })
 
         dprint(f"[UPLOAD] Loaded aircraft: {name}")
         return current_data, name, name
